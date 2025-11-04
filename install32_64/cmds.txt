@@ -1,0 +1,1 @@
+ C:\pin\pin.exe -t "C:\pin\source\tools\mpintoolz\x64\Release\mpintoolz.dll" -w wow.exe -- "C:\Wow\_retail_\wow.exe"

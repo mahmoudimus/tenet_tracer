@@ -1,0 +1,13 @@
+.vs/
+*.opensdf
+*.sdf
+*.suo
+*.sln
+*.user
+*.bak
+x64/
+Release
+Debug
+obj-ia32
+obj-intel64
+*/my_paths.h
