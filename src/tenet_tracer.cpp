@@ -17,13 +17,14 @@
 //
 
 #include "pin.H"
-
 #include <iostream>
+#include <memory>
 #include <fstream>
 #include <string>
 #include <vector>
 #include <utility>
 #include <map>
+#include <sys/stat.h>
 
 #if defined(_WIN32) || defined(_WIN64)
 namespace WINDOWS
@@ -44,6 +45,8 @@ ofstream* meta_log;
 #else
 #define PC "rip"
 #endif
+
+using std::unique_ptr;
 
 //
 // Tool Arguments
@@ -209,8 +212,8 @@ static void ensure_directory_for_prefix(const std::string& prefix)
     if (pos == std::string::npos) return;
     std::string dir = prefix.substr(0, pos);
     if (dir.empty()) return;
-#if defined(_WIN32) || defined(_WIN64)
-    // Recursively create directories
+
+    // Create directories recursively by building up the path
     size_t start = 0;
     while (true)
     {
@@ -218,12 +221,11 @@ static void ensure_directory_for_prefix(const std::string& prefix)
         std::string subdir = dir.substr(0, sep);
         if (!subdir.empty())
         {
-            WINDOWS::CreateDirectoryA(subdir.c_str(), nullptr);
+            mkdir(subdir.c_str(), 0755);
         }
         if (sep == std::string::npos) break;
         start = sep + 1;
     }
-#endif
 }
 
 // Utility to get image name for an address

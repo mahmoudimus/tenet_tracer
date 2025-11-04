@@ -240,11 +240,12 @@
       <TargetEnvironment>X64</TargetEnvironment>
     </Midl>
     <ClCompile>
-      <AdditionalOptions>/GR- /GS- /EHs- /EHa- /fp:strict /Oi- /FIinclude/msvc_compat.h -Wno-non-c-typedef-for-linkage -Wno-microsoft-include -Wno-unicode /D_WINDOWS_H_PATH_="C:/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0/um" %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalOptions>/GR- /GS- /EHs- /EHa- /fp:strict /Oi- /FIinclude/msvc_compat.h -Wno-non-c-typedef-for-linkage -Wno-microsoft-include -Wno-unicode -Wno-nonportable-include-path %(AdditionalOptions)</AdditionalOptions>
       <IntrinsicFunctions>false</IntrinsicFunctions>
       <WholeProgramOptimization>false</WholeProgramOptimization>
       <AdditionalIncludeDirectories>..\..\include\pin;..\..\include\pin\gen;..\InstLib;..\..\..\extras\xed-intel64\include\xed;..\..\..\extras\components\include;..\..\..\extras\cxx\include;..\..\..\extras;..\..\..\extras\crt\include;..\..\..\extras\crt;..\..\..\extras\crt\include\arch-x86_64;..\..\..\extras\crt\include\kernel\uapi;..\..\..\extras\crt\include\kernel\uapi\asm-x86;$(ProjectDir)include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>TARGET_IA32E;HOST_IA32E;TARGET_WINDOWS;PIN_CRT=1;__LP64__;_LIBCPP_DISABLE_AVAILABILITY;_LIBCPP_NO_VCRUNTIME;__BIONIC__</PreprocessorDefinitions>
+      <PreprocessorDefinitions>TARGET_IA32E;HOST_IA32E;TARGET_WINDOWS;PIN_CRT=1;__PIN__=1;__LP64__;_LIBCPP_DISABLE_AVAILABILITY;_LIBCPP_NO_VCRUNTIME;__BIONIC__;BIGARRAY_MULTIPLIER=1;WIN32;_STLP_IMPORT_IOSTREAMS;_CRT_SECURE_NO_DEPRECATE;
+_SECURE_SCL=0;_WINDOWS_H_PATH_=C:/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0/um</PreprocessorDefinitions>
       <MinimalRebuild>false</MinimalRebuild>
       <ExceptionHandling>
       </ExceptionHandling>
@@ -259,12 +260,12 @@
       <DebugInformationFormat>
       </DebugInformationFormat>
       <DisableSpecificWarnings>4530;%(DisableSpecificWarnings)</DisableSpecificWarnings>
-      <LanguageStandard>stdcpp17</LanguageStandard>
+      <LanguageStandard>stdcpp14</LanguageStandard>
       <LanguageStandard_C>Default</LanguageStandard_C>
     </ClCompile>
     <Link>
       <AdditionalOptions>/export:main /SAFESEH:NO /IGNORE:4210 /IGNORE:4049 %(AdditionalOptions)</AdditionalOptions>
-      <AdditionalDependencies>pin.lib;xed.lib;pinipc.lib;c++.lib;pincrt.lib;kernel32.lib;crtbeginS.obj</AdditionalDependencies>
+      <AdditionalDependencies>pin.lib;xed.lib;pinipc.lib;atomic.lib;c++.lib;pincrt.lib;kernel32.lib;crtbeginS.obj</AdditionalDependencies>
       <AdditionalLibraryDirectories>..\..\..\intel64\lib;..\..\..\intel64\lib-ext;..\..\..\extras\xed-intel64\lib;..\..\..\intel64\runtime\pincrt;..\..\..\extras\components\lib\intel64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <IgnoreAllDefaultLibraries>true</IgnoreAllDefaultLibraries>
       <IgnoreSpecificDefaultLibraries>%(IgnoreSpecificDefaultLibraries)</IgnoreSpecificDefaultLibraries>
