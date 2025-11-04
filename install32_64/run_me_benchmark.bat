@@ -24,7 +24,7 @@ rem PIN_DIR is your root directory of Intel Pin
 set PIN_DIR=C:\pin\
 
 rem PIN_TOOLS_DIR is your directory with this script and the Pin Tools
-set PIN_TOOLS_DIR=C:\pin\source\tools\mpintoolz\install32_64\
+set PIN_TOOLS_DIR=C:\pin\source\tools\tenet_tracer\install32_64\
 
 set PINTOOL32=%PIN_TOOLS_DIR%\TenetTracer32.dll
 set PINTOOL64=%PIN_TOOLS_DIR%\TenetTracer64.dll

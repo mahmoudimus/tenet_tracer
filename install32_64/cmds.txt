@@ -1,1 +1,1 @@
- C:\pin\pin.exe -t "C:\pin\source\tools\mpintoolz\x64\Release\mpintoolz.dll" -w wow.exe -- "C:\Wow\_retail_\wow.exe"
+ C:\pin\pin.exe -t "C:\pin\source\tools\tenet_tracer\x64\Release\tenet_tracer.dll" -w wow.exe -- "C:\Wow\_retail_\wow.exe"

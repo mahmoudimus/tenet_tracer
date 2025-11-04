@@ -4,22 +4,22 @@ Windows Registry Editor Version 5.00
 @="Run with PIN (Tenet Tracer)"
 
 [HKEY_CLASSES_ROOT\exefile\shell\PIN_run\command]
-@="\"C:\\pin\\source\\tools\\mpintoolz\\install32_64\\run_me.bat\" \"%1\" \"exe\" \"U\""
+@="\"C:\\pin\\source\\tools\\tenet_tracer\\install32_64\\run_me.bat\" \"%1\" \"exe\" \"U\""
 
 [HKEY_CLASSES_ROOT\dllfile\shell\PIN_run]
 @="Run with PIN (Tenet Tracer)"
 
 [HKEY_CLASSES_ROOT\dllfile\shell\PIN_run\command]
-@="\"C:\\pin\\source\\tools\\mpintoolz\\install32_64\\run_me.bat\" \"%1\" \"dll\" \"U\""
+@="\"C:\\pin\\source\\tools\\tenet_tracer\\install32_64\\run_me.bat\" \"%1\" \"dll\" \"U\""
 
 [HKEY_CLASSES_ROOT\exefile\shell\PIN_run_admin]
 @="Run with PIN (Tenet Tracer) - as Administrator"
 
 [HKEY_CLASSES_ROOT\exefile\shell\PIN_run_admin\command]
-@="\"C:\\pin\\source\\tools\\mpintoolz\\install32_64\\run_me.bat\" \"%1\" \"exe\" \"A\""
+@="\"C:\\pin\\source\\tools\\tenet_tracer\\install32_64\\run_me.bat\" \"%1\" \"exe\" \"A\""
 
 [HKEY_CLASSES_ROOT\dllfile\shell\PIN_run_admin]
 @="Run with PIN (Tenet Tracer) - as Administrator"
 
 [HKEY_CLASSES_ROOT\dllfile\shell\PIN_run_admin\command]
-@="\"C:\\pin\\source\\tools\\mpintoolz\\install32_64\\run_me.bat\" \"%1\" \"dll\" \"A\""
+@="\"C:\\pin\\source\\tools\\tenet_tracer\\install32_64\\run_me.bat\" \"%1\" \"dll\" \"A\""
