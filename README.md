@@ -2,7 +2,7 @@
 
 A Pin Tool for tracing instructions specifically for [tenet](https://github.com/gaasedelen/tenet/).
 
-A special thank you to [hasherezade](https://github.com/hasherezade)'s [tiny_tracer](https://github.com/hasherezade/tiny_tracer) of which that tool is generously ripped from.
+A special thank you to [hasherezade](https://github.com/hasherezade)'s [tiny_tracer](https://github.com/hasherezade/tiny_tracer) of which this tool is generously built on.
 
 ## TRACE FORMAT
 
