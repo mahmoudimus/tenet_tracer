@@ -18,10 +18,9 @@
 //
 // Example when SQLite extension is compiled and included:
 //   #include "SqliteLogHandler.h"
-//   #include "LoggerSqliteExt.h" // optional sugar
 //   auto logger = tenet_tracer::LoggerBuilder()
 //       .addFileHandler("trace.log", 10*1024*1024, true)
-//       .addSqliteHandler(db, "logs")  // provided by LoggerSqliteExt.h
+//       .addHandler<tenet_tracer::SqliteLogHandler>(db, "logs", 100)
 //       .setMinLevel(LogLevel::Info)
 //       .build();
 //
@@ -329,6 +328,15 @@ namespace tenet_tracer
         LoggerBuilder& addHandler(std::unique_ptr<LogHandler> handler)
         {
             handlers_.push_back(std::move(handler));
+            return *this;
+        }
+
+        // Templated version: construct handler in-place
+        // Usage: .addHandler<SqliteLogHandler>(db, "trace", 100)
+        template<typename HandlerType, typename... Args>
+        LoggerBuilder& addHandler(Args&&... args)
+        {
+            handlers_.push_back(std::make_unique<HandlerType>(std::forward<Args>(args)...));
             return *this;
         }
 

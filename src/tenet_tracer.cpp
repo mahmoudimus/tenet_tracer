@@ -27,21 +27,28 @@ namespace WINDOWS
 
 #include "ImageManager.h"
 #include "Logger.h"
-#if defined(USE_SQLITE3)
-#include "SqliteLogHandler.h"
-#endif
+
 #include "PathUtils.h"
 
-// -----------------------------------------------------
-// Global loggers (RAII via unique_ptr)
-std::unique_ptr<tenet_tracer::Logger> g_logger;
-std::unique_ptr<tenet_tracer::Logger> meta_logger;
-
 #ifdef __i386__
-#  define PC "eip"
+#define PC "eip"
 #else
-#  define PC "rip"
+#define PC "rip"
 #endif
+
+#if defined(USE_SQLITE3)
+#include "SqliteLogHandler.h"
+// Global SQLite database for trace logging
+sqlite3* g_trace_db = nullptr;
+// Global queue for all trace entries
+std::vector<tenet_tracer::GlobalTraceEntry> tenet_tracer::g_trace_queue;
+PIN_LOCK tenet_tracer::g_trace_queue_lock;
+PIN_THREAD_UID tenet_tracer::g_flush_thread_uid = 0;
+bool tenet_tracer::g_flush_thread_should_exit = false;
+// Global shared state to avoid function-local statics in SqliteLogHandler
+tenet_tracer::SqliteSharedState tenet_tracer::g_sqlite_state;
+#endif
+std::unique_ptr<tenet_tracer::Logger> meta_logger;
 
 // -----------------------------------------------------
 // Tool arguments (knobs)
@@ -418,18 +425,32 @@ static VOID record_diff(const CONTEXT* cpu, ADDRINT pc, VOID* v)
         PathUtils::EnsureDirectoryExists(prefix);
         // prefix.<image>.log ; handler will NOT append tid (we include tid in name below if desired)
         std::string baseFilename = prefix + "." + sanitized_image_name + ".log";
-        auto loggerPtr = tenet_tracer::LoggerBuilder()
-                         .addFileHandler(
-                            baseFilename, 
-                            0 /* do not roll over */,
-                            true /*appendThreadId*/,
-                            false /* no level prefix */)
-                         .build();
+        // Create builder and conditionally add handlers
+        tenet_tracer::LoggerBuilder builder;
+        
+#if defined(USE_SQLITE3)
+        // SQLite mode: use SQLite handler for structured query support (writes to global queue)
+        builder.addHandler<tenet_tracer::SqliteLogHandler>(
+            g_trace_db,
+            sanitized_image_name,
+            100  // batch size
+        );
+        const char* _log_type = "sqlite";
+#else
+        // File mode: use file handler
+        builder.addFileHandler(
+            baseFilename,
+            0 /* do not roll over */,
+            true /*appendThreadId*/,
+            false /* no level prefix */);
+        const char* _log_type = "file";
+#endif
+        auto loggerPtr = builder.build();
         loggerPtr->setThreadId(static_cast<unsigned>(tid));
         if (meta_logger)
         {
-            meta_logger->infof("Opened log file: %s for image '%s' (tid %u)",
-                               baseFilename.c_str(), image_name.c_str(), static_cast<unsigned>(tid));
+            meta_logger->infof("Opened log (%s) for image '%s' (tid %u)",
+                                _log_type, image_name.c_str(), static_cast<unsigned>(tid));
         }
         out_logger = loggerPtr.get();
         data->m_image_logs[sanitized_image_name] = std::move(loggerPtr);
@@ -567,6 +588,19 @@ static VOID OnInst(INS ins, VOID* v)
 // -----------------------------------------------------
 // Shutdown & exceptions
 
+/*!
+ * PrepareForFini callback - stop background threads before final cleanup
+ */
+static VOID PrepareForFini(VOID* v)
+{
+#if defined(USE_SQLITE3)
+    // Stop background flush thread (it will flush remaining entries)
+    if (meta_logger) meta_logger->info("Stopping background SQLite flush thread...");
+    tenet_tracer::SqliteLogHandler::StopBackgroundFlushThread();
+    if (meta_logger) meta_logger->info("Background flush thread stopped");
+#endif
+}
+
 static VOID Fini(INT32, VOID* v)
 {
     auto& context = *static_cast<ToolContext*>(v);
@@ -591,6 +625,21 @@ static VOID Fini(INT32, VOID* v)
         }
     }
     context.m_terminated_threads.clear();
+
+#if defined(USE_SQLITE3)
+    // Flush any remaining entries in queue (background thread should have done most)
+    if (g_trace_db) {
+        if (meta_logger) meta_logger->info("Flushing remaining trace queue to SQLite database...");
+        tenet_tracer::SqliteLogHandler::FlushQueueToDatabase(g_trace_db);
+        if (meta_logger) meta_logger->info("Trace queue flushed successfully");
+        
+        // Force WAL checkpoint before closing
+        sqlite3_exec(g_trace_db, "PRAGMA wal_checkpoint(FULL);", nullptr, nullptr, nullptr);
+        sqlite3_close(g_trace_db);
+        g_trace_db = nullptr;
+        if (meta_logger) meta_logger->info("SQLite database closed");
+    }
+#endif
 }
 
 static EXCEPT_HANDLING_RESULT ExceptionHandler(THREADID /*tid*/, EXCEPTION_INFO* pExceptInfo,
@@ -628,15 +677,50 @@ int main(int argc, char* argv[])
     PIN_AddInternalExceptionHandler(ExceptionHandler, nullptr);
 
     // Global logs (rotated at 10MB)
-    const auto logFile = KnobOutputFilePrefix.Value() + ".log";
     const auto metaFile = KnobOutputFilePrefix.Value() + ".meta.txt";
 
     meta_logger = tenet_tracer::LoggerBuilder()
                   .addFileHandler(metaFile, 10 * 1024 * 1024, false)
                   .build();
 
-
-    meta_logger->infof("Trace logs are written to: %s", logFile.c_str());
+#if defined(USE_SQLITE3)
+    // Initialize global trace queue lock
+    PIN_InitLock(&tenet_tracer::g_trace_queue_lock);
+    
+    // Initialize SQLite database for structured trace logging
+    const auto outputFile = KnobOutputFilePrefix.Value() + ".db";
+    int rc = sqlite3_open(outputFile.c_str(), &g_trace_db);
+    if (rc == SQLITE_OK)
+    {
+        meta_logger->infof("SQLite trace database opened: %s", outputFile.c_str());
+        // Verify database is accessible by creating a test table
+        char* errMsg = nullptr;
+        rc = sqlite3_exec(g_trace_db, "CREATE TABLE IF NOT EXISTS _init_test (id INTEGER);", nullptr, nullptr, &errMsg);
+        if (rc == SQLITE_OK) {
+            meta_logger->info("SQLite database initialized and writable");
+            sqlite3_exec(g_trace_db, "DROP TABLE IF EXISTS _init_test;", nullptr, nullptr, nullptr);
+        } else {
+            meta_logger->errorf("SQLite database not writable: %s", errMsg ? errMsg : "unknown error");
+            if (errMsg) sqlite3_free(errMsg);
+        }
+        
+        // Start background flush thread to periodically write batches
+        tenet_tracer::SqliteLogHandler::StartBackgroundFlushThread(g_trace_db);
+        meta_logger->info("Background SQLite flush thread started");
+    }
+    else
+    {
+        const char* errMsg = g_trace_db ? sqlite3_errmsg(g_trace_db) : "unknown error";
+        meta_logger->errorf("Failed to open SQLite database %s: %s (rc=%d)", outputFile.c_str(), errMsg, rc);
+        if (g_trace_db) {
+            sqlite3_close(g_trace_db);
+        }
+        g_trace_db = nullptr;
+    }
+#else
+    const auto outputFile = KnobOutputFilePrefix.Value() + ".log";
+    meta_logger->infof("Trace logs are written to: %s", outputFile.c_str());
+#endif
     meta_logger->infof("Metadata logging to: %s", metaFile.c_str());
 
     // Global tool context
@@ -686,6 +770,7 @@ int main(int argc, char* argv[])
 
     INS_AddInstrumentFunction(OnInst, g_context.get());
 
+    PIN_AddPrepareForFiniFunction(PrepareForFini, nullptr);
     PIN_AddFiniFunction(Fini, g_context.get());
 
     // Run the target (never returns)
