@@ -176,7 +176,7 @@ namespace tenet_tracer
     {
     public:
         SqliteLogHandler(sqlite3* db, const std::string& tableName, size_t batchSize = 100)
-            : db_(db), tableName_(tableName), batchSize_(batchSize) {
+            : db_(db), tableName_(tableName) {
             // Just store table name - all writes go to global queue
             // Tables will be created when flushing
         }
@@ -491,7 +491,6 @@ namespace tenet_tracer
 
         sqlite3* db_;
         std::string tableName_;
-        size_t batchSize_;
     };
 
 

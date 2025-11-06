@@ -399,7 +399,19 @@ static VOID OnImageUnload(IMG img, VOID* v)
 static VOID record_diff(const CONTEXT* cpu, ADDRINT pc, VOID* v)
 {
     auto& context = *static_cast<ToolContext*>(v);
-    if (!context.m_tracing_enabled || !context.m_images->isInterestingAddress(pc)) return;
+    if (!context.m_tracing_enabled || !context.m_images->isInterestingAddress(pc))
+    {
+        // Avoid carrying stale memory sizes across uninterested instructions
+        THREADID _tid = PIN_ThreadId();
+        ThreadData* _td = context.GetThreadLocalData(_tid);
+        if (_td)
+        {
+            _td->mem_r_size = 0;
+            _td->mem_r2_size = 0;
+            _td->mem_w_size = 0;
+        }
+        return;
+    }
 
     THREADID tid = PIN_ThreadId();
     ThreadData* data = context.GetThreadLocalData(tid);
@@ -487,33 +499,36 @@ static VOID record_diff(const CONTEXT* cpu, ADDRINT pc, VOID* v)
     // Memory reads/writes (dump bytes)
     if (data->mem_r_size)
     {
-        std::memset(data->m_scratch, 0, data->mem_r_size);
-        PIN_SafeCopy(data->m_scratch, reinterpret_cast<const void*>(data->mem_r_addr), data->mem_r_size);
+        const UINT32 to_copy = static_cast<UINT32>(std::min<ADDRINT>(sizeof(data->m_scratch), data->mem_r_size));
+        std::memset(data->m_scratch, 0, to_copy);
+        PIN_SafeCopy(data->m_scratch, reinterpret_cast<const void*>(data->mem_r_addr), to_copy);
         ADDRINT a = context.RebaseAddress(data->mem_r_addr);
         oss << ",mr=0x" << a << ":";
-        for (UINT32 i = 0; i < data->mem_r_size; ++i)
+        for (UINT32 i = 0; i < to_copy; ++i)
             oss << std::setw(2) << std::setfill('0') << (static_cast<unsigned>(static_cast<unsigned char>(data->
                 m_scratch[i])) & 0xff);
         data->mem_r_size = 0;
     }
     if (data->mem_r2_size)
     {
-        std::memset(data->m_scratch, 0, data->mem_r2_size);
-        PIN_SafeCopy(data->m_scratch, reinterpret_cast<const void*>(data->mem_r2_addr), data->mem_r2_size);
+        const UINT32 to_copy = static_cast<UINT32>(std::min<ADDRINT>(sizeof(data->m_scratch), data->mem_r2_size));
+        std::memset(data->m_scratch, 0, to_copy);
+        PIN_SafeCopy(data->m_scratch, reinterpret_cast<const void*>(data->mem_r2_addr), to_copy);
         ADDRINT a = context.RebaseAddress(data->mem_r2_addr);
         oss << ",mr=0x" << a << ":";
-        for (UINT32 i = 0; i < data->mem_r2_size; ++i)
+        for (UINT32 i = 0; i < to_copy; ++i)
             oss << std::setw(2) << std::setfill('0') << (static_cast<unsigned>(static_cast<unsigned char>(data->
                 m_scratch[i])) & 0xff);
         data->mem_r2_size = 0;
     }
     if (data->mem_w_size)
     {
-        std::memset(data->m_scratch, 0, data->mem_w_size);
-        PIN_SafeCopy(data->m_scratch, reinterpret_cast<const void*>(data->mem_w_addr), data->mem_w_size);
+        const UINT32 to_copy = static_cast<UINT32>(std::min<ADDRINT>(sizeof(data->m_scratch), data->mem_w_size));
+        std::memset(data->m_scratch, 0, to_copy);
+        PIN_SafeCopy(data->m_scratch, reinterpret_cast<const void*>(data->mem_w_addr), to_copy);
         ADDRINT a = context.RebaseAddress(data->mem_w_addr);
         oss << ",mw=0x" << a << ":";
-        for (UINT32 i = 0; i < data->mem_w_size; ++i)
+        for (UINT32 i = 0; i < to_copy; ++i)
             oss << std::setw(2) << std::setfill('0') << (static_cast<unsigned>(static_cast<unsigned char>(data->
                 m_scratch[i])) & 0xff);
         data->mem_w_size = 0;
@@ -548,13 +563,6 @@ static VOID record_write(THREADID tid, ADDRINT access_addr, UINT32 access_size, 
 
 static VOID OnInst(INS ins, VOID* v)
 {
-    // Always dump diff
-    INS_InsertCall(ins, IPOINT_BEFORE, AFUNPTR(record_diff),
-                   IARG_CONST_CONTEXT,
-                   IARG_INST_PTR,
-                   IARG_PTR, v,
-                   IARG_END);
-
     // If instruction uses memory, capture addresses/sizes
     if (INS_IsMemoryRead(ins))
     {
@@ -570,7 +578,7 @@ static VOID OnInst(INS ins, VOID* v)
         INS_InsertCall(ins, IPOINT_BEFORE, AFUNPTR(record_read2),
                        IARG_THREAD_ID,
                        IARG_MEMORYREAD2_EA,
-                       IARG_MEMORYREAD_SIZE,
+                       IARG_MEMORYREAD_SIZE, // IARG_MEMORYREAD2_SIZE does not exist, but we can assume that both operands have the same size
                        IARG_PTR, v,
                        IARG_END);
     }
@@ -583,6 +591,13 @@ static VOID OnInst(INS ins, VOID* v)
                        IARG_PTR, v,
                        IARG_END);
     }
+
+    // Dump diff after memory addresses have been captured
+    INS_InsertCall(ins, IPOINT_BEFORE, AFUNPTR(record_diff),
+                   IARG_CONST_CONTEXT,
+                   IARG_INST_PTR,
+                   IARG_PTR, v,
+                   IARG_END);
 }
 
 // -----------------------------------------------------

@@ -31,7 +31,7 @@
     <RootNamespace>tenet_tracer</RootNamespace>
     <Keyword>Win32Proj</Keyword>
     <ProjectName>tenet_tracer</ProjectName>
-    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+    <WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'" Label="Configuration">
@@ -192,7 +192,7 @@
       <Optimization>Disabled</Optimization>
       <AdditionalIncludeDirectories>..\..\include\pin;..\..\include\pin\gen;..\InstLib;..\..\..\extras\xed-intel64\include\xed;..\..\..\extras\components\include;..\..\..\extras\cxx\include;..\..\..\extras;..\..\..\extras\crt\include;..\..\..\extras\crt;..\..\..\extras\crt\include\arch-x86_64;..\..\..\extras\crt\include\kernel\uapi;..\..\..\extras\crt\include\kernel\uapi\asm-x86;$(ProjectDir)include;$(ProjectDir)vendor;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>TARGET_IA32E;HOST_IA32E;TARGET_WINDOWS;PIN_CRT=1;__PIN__=1;__LP64__;_LIBCPP_DISABLE_AVAILABILITY;_LIBCPP_NO_VCRUNTIME;__BIONIC__;BIGARRAY_MULTIPLIER=1;WIN64;_STLP_IMPORT_IOSTREAMS;_CRT_SECURE_NO_DEPRECATE;
-_SECURE_SCL=0;_WINDOWS_H_PATH_=C:/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0/um</PreprocessorDefinitions>
+_SECURE_SCL=0;_WINDOWS_H_PATH_=$(WindowsSdkDir)\Include\$(WindowsTargetPlatformVersion)\um</PreprocessorDefinitions>
       <MinimalRebuild>false</MinimalRebuild>
       <ExceptionHandling>
       </ExceptionHandling>
@@ -335,7 +335,7 @@ _SECURE_SCL=0;_WINDOWS_H_PATH_=C:/Program Files (x86)/Windows Kits/10/Include/10
       <WholeProgramOptimization>false</WholeProgramOptimization>
       <AdditionalIncludeDirectories>..\..\include\pin;..\..\include\pin\gen;..\InstLib;..\..\..\extras\xed-intel64\include\xed;..\..\..\extras\components\include;..\..\..\extras\cxx\include;..\..\..\extras;..\..\..\extras\crt\include;..\..\..\extras\crt;..\..\..\extras\crt\include\arch-x86_64;..\..\..\extras\crt\include\kernel\uapi;..\..\..\extras\crt\include\kernel\uapi\asm-x86;$(ProjectDir)include;$(ProjectDir)vendor;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>TARGET_IA32E;HOST_IA32E;TARGET_WINDOWS;PIN_CRT=1;__PIN__=1;__LP64__;_LIBCPP_DISABLE_AVAILABILITY;_LIBCPP_NO_VCRUNTIME;__BIONIC__;BIGARRAY_MULTIPLIER=1;WIN64;_STLP_IMPORT_IOSTREAMS;_CRT_SECURE_NO_DEPRECATE;
-_SECURE_SCL=0;_WINDOWS_H_PATH_=C:/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0/um</PreprocessorDefinitions>
+_SECURE_SCL=0;_WINDOWS_H_PATH_=$(WindowsSdkDir)\Include\$(WindowsTargetPlatformVersion)\um</PreprocessorDefinitions>
       <MinimalRebuild>false</MinimalRebuild>
       <ExceptionHandling>
       </ExceptionHandling>
@@ -386,8 +386,8 @@ _SECURE_SCL=0;_WINDOWS_H_PATH_=C:/Program Files (x86)/Windows Kits/10/Include/10
       <IntrinsicFunctions>false</IntrinsicFunctions>
       <WholeProgramOptimization>false</WholeProgramOptimization>
       <AdditionalIncludeDirectories>..\..\include\pin;..\..\include\pin\gen;..\InstLib;..\..\..\extras\xed-intel64\include\xed;..\..\..\extras\components\include;..\..\..\extras\cxx\include;..\..\..\extras;..\..\..\extras\crt\include;..\..\..\extras\crt;..\..\..\extras\crt\include\arch-x86_64;..\..\..\extras\crt\include\kernel\uapi;..\..\..\extras\crt\include\kernel\uapi\asm-x86;$(ProjectDir)include;$(ProjectDir)vendor;$(ProjectDir)vendor\sqlite-3.51.0;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <PreprocessorDefinitions>TARGET_IA32E;HOST_IA32E;TARGET_WINDOWS;PIN_CRT=1;__PIN__=1;__LP64__;_LIBCPP_DISABLE_AVAILABILITY;_LIBCPP_NO_VCRUNTIME;__BIONIC__;BIGARRAY_MULTIPLIER=1;WIN64;_STLP_IMPORT_IOSTREAMS;_CRT_SECURE_NO_DEPRECATE;
-_SECURE_SCL=0;_WINDOWS_H_PATH_=C:/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0/um;USE_SQLITE3=1</PreprocessorDefinitions>
+      <PreprocessorDefinitions>TARGET_IA32E;HOST_IA32E;TARGET_WINDOWS;PIN_CRT=1;__PIN__=1;__LP64__;_LIBCPP_DISABLE_AVAILABILITY;_LIBCPP_NO_VCRUNTIME;__BIONIC__;BIGARRAY_MULTIPLIER=1;WIN32;WIN64;USING_XED;_STLP_IMPORT_IOSTREAMS;_CRT_SECURE_NO_DEPRECATE;
+_SECURE_SCL=0;_WINDOWS_H_PATH_=$(WindowsSdkDir)Include\$(WindowsTargetPlatformVersion)\um;USE_SQLITE3=1</PreprocessorDefinitions>
       <MinimalRebuild>false</MinimalRebuild>
       <ExceptionHandling>
       </ExceptionHandling>
@@ -445,7 +445,6 @@ _SECURE_SCL=0;_WINDOWS_H_PATH_=C:/Program Files (x86)/Windows Kits/10/Include/10
     <ClInclude Include="vendor\sqlite-3.51.0\sqlite3ext.h" />
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="src\ImageManager.cpp" />
     <ClCompile Include="src\tenet_tracer.cpp" />
     <ClCompile Include="vendor\sqlite-3.51.0\sqlite3.c">
       <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|x64'">true</ExcludedFromBuild>
