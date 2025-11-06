@@ -6,9 +6,28 @@ A special thank you to [hasherezade](https://github.com/hasherezade)'s [tiny_tra
 
 ## TRACE FORMAT
 
-Input:  reg=0xval,reg=0xval,rip=0xpc,mr=0xaddr:hexbytes,mw=0xaddr:hexbytes
-Stored: timestamp(int), tid(int), pc(int), registers(json), mem_reads(json), mem_writes(json)
+Input:  `reg=0xval,reg=0xval,rip=0xpc,mr=0xaddr:hexbytes,mw=0xaddr:hexbytes`
+Stored: `timestamp(int), tid(int), pc(int), registers(json), mem_reads(json), mem_writes(json)`
 Output: Same as input (via [`scripts/dump_trace_db.py`](./scripts/dump_trace_db.py))
+
+### Real Trace Example
+
+```csv
+rsp=0xdaf4efefd8,rip=0x7ff9339627a0,mr=0x7ff93481aa18:a0279633f97f0000,mw=0xdaf4efefd8:1b5c7b34f97f0000
+rsp=0xdaf4efefa0,rip=0x7ff9339627a4
+rip=0x7ff9339627a9,mw=0xdaf4efefc0:20867c34f97f0000
+rdx=0x7ff9339b1730,rip=0x7ff9339627b0
+rip=0x7ff9339627b5,mw=0xdaf4efefc8:0000000000000000
+r8=0xdaf4efefc0,rip=0x7ff9339627ba
+rsp=0xdaf4efefa0,rip=0x7ff9339627c1,mr=0xdaf4efef98:c1279633f97f0000
+rip=0x7ff9339627c6
+rcx=0x0,rip=0x7ff9339627c8
+rip=0x7ff9339627ca
+rcx=0x1,rip=0x7ff9339627cd
+rax=0x1,rip=0x7ff9339627cf
+rsp=0xdaf4efefd8,rip=0x7ff9339627d3
+rsp=0xdaf4efe648,rip=0x7ff9339627a0,mr=0x7ff93481aa18:a0279633f97f0000,mw=0xdaf4efe648:1b5c7b34f97f0000
+```
 
 ### SQLite Trace Logging: Design and Features
 
@@ -202,17 +221,22 @@ sqlite3_close(db);
 
 ### On Windows
 
-To compile the prepared project you need to use [Visual Studio >= 2012](https://visualstudio.microsoft.com/downloads/), but lower than 2022. It was tested with [Intel Pin 3.30](https://software.intel.com/en-us/articles/pin-a-binary-instrumentation-tool-downloads).
+**This project will not work if you use `Windows* (MSVC)`. This is CRITICALLY IMPORTANT!**
 
-Clone this repo into `\source\tools` that is inside your Pin root directory. Open the project in Visual Studio and build. Detailed description available [here](https://github.com/hasherezade/tenet_tracer/wiki/Installation#on-windows).
+To compile the prepared project you need to use [Visual Studio 2022](https://visualstudio.microsoft.com/downloads/). 
 
-To build with Intel Pin < 3.26 on Windows, use the appropriate legacy Visual Studio project.
+It was tested with [Intel Pin 3.31](https://www.intel.com/content/www/us/en/developer/articles/tool/pin-a-binary-instrumentation-tool-downloads.html#inpage-nav-undefined-1)'s `Windows* (LLVM clang-cl)`.
+
+Why?
+
+Because Intel Pin Tools for LLVM's clang-cl support all of C++11 and some extras support some of C++14. This allows us to write Pin code in MODERN C++.
+
+Now, just clone this repo into `\source\tools` that is inside your Pin root directory. Open the project in Visual Studio and build.
 
 ## WARNINGS
 
 - In order for Pin to work correctly, Kernel Debugging must be **DISABLED**.
 - In [`install32_64`](./install32_64) you can find a utility that checks if Kernel Debugger is disabled (`kdb_check.exe`, [source](https://github.com/hasherezade/pe_utils/tree/master/kdb_check)), and it is used by the Tenet Tracer's `.bat` scripts. This utilty sometimes gets flagged as a malware by Windows Defender (it is a known false positive). If you encounter this issue, you may need to [exclude](https://support.microsoft.com/en-us/windows/add-an-exclusion-to-windows-security-811816c0-4dfd-af4a-47e4-c301afe13b26) the installation directory from Windows Defender scans.
-- Since the version 3.20 Pin has dropped a support for **old versions of Windows**. If you need to use the tool on Windows < 8, try to compile it with Pin 3.19.
 
 ### Potential Future Enhancements
 
