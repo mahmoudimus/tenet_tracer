@@ -139,6 +139,7 @@ This pattern is common in high-performance tracing tools: keep the hot path (ins
 #include <sqlite3.h>
 
 #include "Logger.h" // for LogHandler, LogLevel, logLevelToString
+#include "PinLocker.h"
 
 namespace tenet_tracer
 {
@@ -155,7 +156,7 @@ namespace tenet_tracer
     
     // Global queue and lock - shared by all SqliteLogHandler instances
     extern std::vector<GlobalTraceEntry> g_trace_queue;
-    extern PIN_LOCK g_trace_queue_lock;
+    extern PinSpinLock g_trace_queue_lock;
     extern PIN_THREAD_UID g_flush_thread_uid;  // Background flush thread UID
     extern bool g_flush_thread_should_exit;    // Flag to signal background thread to exit
     
@@ -204,9 +205,10 @@ namespace tenet_tracer
             globalEntry.mem_reads = entry.mem_reads;
             globalEntry.mem_writes = entry.mem_writes;
             
-            PIN_GetLock(&g_trace_queue_lock, 0);
-            g_trace_queue.push_back(globalEntry);
-            PIN_ReleaseLock(&g_trace_queue_lock);
+            {
+                auto lock = g_trace_queue_lock.acquire_write();
+                g_trace_queue.push_back(globalEntry);
+            }
         }
 
         void close() override {
@@ -222,14 +224,15 @@ namespace tenet_tracer
             std::vector<GlobalTraceEntry> batch;
             batch.reserve(batchSize);
             
-            PIN_GetLock(&g_trace_queue_lock, 0);
-            size_t available = g_trace_queue.size();
-            if (available > 0) {
-                size_t toTake = (available < batchSize) ? available : batchSize;
-                batch.assign(g_trace_queue.begin(), g_trace_queue.begin() + toTake);
-                g_trace_queue.erase(g_trace_queue.begin(), g_trace_queue.begin() + toTake);
+            {
+                auto lock = g_trace_queue_lock.acquire_write();
+                size_t available = g_trace_queue.size();
+                if (available > 0) {
+                    size_t toTake = (available < batchSize) ? available : batchSize;
+                    batch.assign(g_trace_queue.begin(), g_trace_queue.begin() + toTake);
+                    g_trace_queue.erase(g_trace_queue.begin(), g_trace_queue.begin() + toTake);
+                }
             }
-            PIN_ReleaseLock(&g_trace_queue_lock);
             
             if (batch.empty()) return 0;
             
@@ -342,9 +345,11 @@ namespace tenet_tracer
                 PIN_Sleep(100); // Sleep 100ms
                 
                 // Check if we should exit
-                PIN_GetLock(&g_trace_queue_lock, 0);
-                bool shouldExit = g_flush_thread_should_exit;
-                PIN_ReleaseLock(&g_trace_queue_lock);
+                bool shouldExit;
+                {
+                    auto lock = g_trace_queue_lock.acquire_read();
+                    shouldExit = g_flush_thread_should_exit;
+                }
                 
                 if (shouldExit) {
                     // Flush any remaining entries before exiting
@@ -368,41 +373,46 @@ namespace tenet_tracer
         static void StartBackgroundFlushThread(sqlite3* db) {
             if (!db) return;
             
-            PIN_GetLock(&g_trace_queue_lock, 0);
-            bool alreadyStarted = (g_flush_thread_uid != 0);
-            PIN_ReleaseLock(&g_trace_queue_lock);
+            bool alreadyStarted;
+            {
+                auto lock = g_trace_queue_lock.acquire_read();
+                alreadyStarted = (g_flush_thread_uid != 0);
+            }
             
             if (alreadyStarted) return;
             
             THREADID threadId = PIN_SpawnInternalThread(BackgroundFlushThread, db, 0, &g_flush_thread_uid);
             if (threadId == INVALID_THREADID) {
                 fprintf(stderr, "Failed to spawn background flush thread\n");
-                PIN_GetLock(&g_trace_queue_lock, 0);
+                auto lock = g_trace_queue_lock.acquire_write();
                 g_flush_thread_uid = 0;
-                PIN_ReleaseLock(&g_trace_queue_lock);
             }
         }
         
         // Stop the background flush thread (called from PrepareForFini)
         static void StopBackgroundFlushThread() {
-            PIN_GetLock(&g_trace_queue_lock, 0);
-            PIN_THREAD_UID uid = g_flush_thread_uid;
-            PIN_ReleaseLock(&g_trace_queue_lock);
+            PIN_THREAD_UID uid;
+            {
+                auto lock = g_trace_queue_lock.acquire_read();
+                uid = g_flush_thread_uid;
+            }
             
             if (uid == 0) return;
             
             // Signal thread to exit
-            PIN_GetLock(&g_trace_queue_lock, 0);
-            g_flush_thread_should_exit = true;
-            PIN_ReleaseLock(&g_trace_queue_lock);
+            {
+                auto lock = g_trace_queue_lock.acquire_write();
+                g_flush_thread_should_exit = true;
+            }
             
             // Wait for thread to finish
             INT32 exitCode;
             PIN_WaitForThreadTermination(uid, PIN_INFINITE_TIMEOUT, &exitCode);
             
-            PIN_GetLock(&g_trace_queue_lock, 0);
-            g_flush_thread_uid = 0;
-            PIN_ReleaseLock(&g_trace_queue_lock);
+            {
+                auto lock = g_trace_queue_lock.acquire_write();
+                g_flush_thread_uid = 0;
+            }
         }
 
     private:

@@ -26,6 +26,7 @@ namespace WINDOWS
 #endif
 
 #include "ImageManager.h"
+#include "PinLocker.h"
 #include "Logger.h"
 
 #include "PathUtils.h"
@@ -42,7 +43,7 @@ namespace WINDOWS
 sqlite3* g_trace_db = nullptr;
 // Global queue for all trace entries
 std::vector<tenet_tracer::GlobalTraceEntry> tenet_tracer::g_trace_queue;
-PIN_LOCK tenet_tracer::g_trace_queue_lock;
+PinSpinLock tenet_tracer::g_trace_queue_lock;
 PIN_THREAD_UID tenet_tracer::g_flush_thread_uid = 0;
 bool tenet_tracer::g_flush_thread_should_exit = false;
 // Global shared state to avoid function-local statics in SqliteLogHandler
@@ -141,8 +142,6 @@ public:
     {
         if (meta_logger) meta_logger->info("Initializing ToolContext before creating ImageManager!");
 
-        PIN_InitLock(&m_loaded_images_lock);
-        PIN_InitLock(&m_thread_lock);
         if (meta_logger) meta_logger->info("Initializing ToolContext before getting the thread data key!");
 
         m_tls_key = PIN_CreateThreadDataKey(nullptr);
@@ -176,21 +175,19 @@ public:
 
     void RegisterLoadedImage(ADDRINT low, ADDRINT high, std::string baseName, ADDRINT desired = 0)
     {
-        PIN_GetLock(&m_loaded_images_lock, 0);
+        auto lock = m_loaded_images_lock.acquire_write();
         m_loaded_images.emplace_back(std::move(baseName), low, high, desired);
         std::inplace_merge(m_loaded_images.begin(),
                            m_loaded_images.end() - 1,
                            m_loaded_images.end());
-        PIN_ReleaseLock(&m_loaded_images_lock);
     }
 
     void OnThreadStart(THREADID tid)
     {
         auto* td = new ThreadData();
         SetThreadLocalData(tid, td);
-        PIN_GetLock(&m_thread_lock, 0);
+        auto lock = m_thread_lock.acquire_write();
         m_seen_threads.insert(tid);
-        PIN_ReleaseLock(&m_thread_lock);
     }
 
     void OnThreadFini(THREADID tid)
@@ -200,9 +197,8 @@ public:
         {
             td->CloseAllLogs();
             SetThreadLocalData(tid, nullptr);
-            PIN_GetLock(&m_thread_lock, 0);
+            auto lock = m_thread_lock.acquire_write();
             m_terminated_threads.push_back(td); // freed in Fini()
-            PIN_ReleaseLock(&m_thread_lock);
         }
     }
 
@@ -231,10 +227,10 @@ public:
     bool m_tracing_started;
 
     // Expose lock for rare reads (if you want to lock during read)
-    mutable PIN_LOCK m_loaded_images_lock;
+    mutable PinSpinLock m_loaded_images_lock;
     std::vector<LoadedImage> m_loaded_images; // kept sorted by low_
 
-    mutable PIN_LOCK m_thread_lock;
+    mutable PinSpinLock m_thread_lock;
     std::set<THREADID> m_seen_threads;
     std::vector<ThreadData*> m_terminated_threads;
 
@@ -245,47 +241,40 @@ private:
 public:
     std::string GetImageNameForAddress(ADDRINT addr)
     {
-        // Optional lock for safety (image loads are rare)
-        PIN_GetLock(&this->m_loaded_images_lock, 0);
+        auto lock = this->m_loaded_images_lock.acquire_read();
         LoadedImage probe("probe", addr, 0, 0);
         auto it = std::upper_bound(this->m_loaded_images.begin(),
                                    this->m_loaded_images.end(), probe);
         if (it == this->m_loaded_images.begin())
         {
-            PIN_ReleaseLock(&this->m_loaded_images_lock);
             return "unknown";
         }
         --it;
         if (addr >= it->low_ && addr < it->high_)
         {
             std::string name = it->name_;
-            PIN_ReleaseLock(&this->m_loaded_images_lock);
             return PathUtils::GetBaseName(name);
         }
-        PIN_ReleaseLock(&this->m_loaded_images_lock);
         return "unknown";
     }
 
 
     ADDRINT RebaseAddress(ADDRINT addr)
     {
-        PIN_GetLock(&this->m_loaded_images_lock, 0);
+        auto lock = this->m_loaded_images_lock.acquire_read();
         LoadedImage probe("probe", addr, 0, 0);
         auto it = std::upper_bound(this->m_loaded_images.begin(),
                                    this->m_loaded_images.end(), probe);
         if (it == this->m_loaded_images.begin())
         {
-            PIN_ReleaseLock(&this->m_loaded_images_lock);
             return addr;
         }
         --it;
         if (addr >= it->low_ && addr < it->high_)
         {
             ADDRINT desired = it->desired_base_;
-            PIN_ReleaseLock(&this->m_loaded_images_lock);
             return desired ? (addr - it->low_) + desired : addr;
         }
-        PIN_ReleaseLock(&this->m_loaded_images_lock);
         return addr;
     }
 };
@@ -699,9 +688,6 @@ int main(int argc, char* argv[])
                   .build();
 
 #if defined(USE_SQLITE3)
-    // Initialize global trace queue lock
-    PIN_InitLock(&tenet_tracer::g_trace_queue_lock);
-    
     // Initialize SQLite database for structured trace logging
     const auto outputFile = KnobOutputFilePrefix.Value() + ".db";
     int rc = sqlite3_open(outputFile.c_str(), &g_trace_db);

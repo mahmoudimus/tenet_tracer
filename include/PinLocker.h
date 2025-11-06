@@ -20,6 +20,16 @@ struct PinClientLockPolicy {
     static void unlock(Handle*) { PIN_UnlockClient(); }
 };
 
+// Policy for PIN_LOCK (simple exclusive lock)
+struct PinSpinLockPolicy {
+    typedef PIN_LOCK Handle;
+    static void init(Handle* h) { PIN_InitLock(h); }
+    static void fini(Handle*) { }
+    static void readLock(Handle* h) { PIN_GetLock(h, 0); }
+    static void writeLock(Handle* h) { PIN_GetLock(h, 0); }
+    static void unlock(Handle* h) { PIN_ReleaseLock(h); }
+};
+
 // Generic owning RW lock with RAII guards; Policy supplies the PIN calls
 template <typename Policy>
 class PinRWLock {
@@ -62,3 +72,4 @@ private:
 // Convenient aliases
 using PinRwMutex = PinRWLock<PinRwMutexPolicy>;
 using PinClientMutex = PinRWLock<PinClientLockPolicy>;
+using PinSpinLock = PinRWLock<PinSpinLockPolicy>;
