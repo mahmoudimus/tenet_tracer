@@ -1,30 +1,22 @@
-//
-// pintenet.cpp, a Proof-of-Concept Tenet Tracer with targeted module support
-//
-//  -- by Patrick Biernat & Markus Gaasedelen
-//                   @ RET2 Systems, Inc.
-//
-// Adaptions from the CodeCoverage pin tool by Agustin Gianni as
-// contributed to Lighthouse: https://github.com/gaasedelen/lighthouse
-//
-// Additional modifications were made to support tracing a specific DLL
-// within an executable, inspired by the functionality of the TenetTracer
-// project. In particular, a new knob (`-m`) allows the user to specify
-// the name of a module to trace. When set, tracing will not begin until
-// the specified module is loaded, and only instructions originating from
-// that module will be logged. This mirrors TenetTracer's concept of
-// selecting a `TRACED_MODULE` for DLL-in-EXE scenarios.
-//
+// tenet_tracer_tool.cpp
+// Build with Pin 3.31 (intel64), C++11, /MD. Requires your ImageManager.h and Logger.h.
 
-#include "pin.H"
+#include <array>
+#include <algorithm>
+#include <iomanip>
+#include <cstring>
 #include <iostream>
-#include <memory>
 #include <fstream>
 #include <string>
 #include <vector>
 #include <utility>
 #include <map>
-#include <sys/stat.h>
+#include <memory>
+#include <unordered_map>
+#include <set>
+#include <sstream>
+
+#include "pin.H"
 
 #if defined(_WIN32) || defined(_WIN64)
 namespace WINDOWS
@@ -34,710 +26,669 @@ namespace WINDOWS
 #endif
 
 #include "ImageManager.h"
+#include "Logger.h"
+#if defined(USE_SQLITE3)
+#include "SqliteLogHandler.h"
+#endif
+#include "PathUtils.h"
 
-using std::ofstream;
-
-ofstream* g_log;
-ofstream* meta_log;
+// -----------------------------------------------------
+// Global loggers (RAII via unique_ptr)
+std::unique_ptr<tenet_tracer::Logger> g_logger;
+std::unique_ptr<tenet_tracer::Logger> meta_logger;
 
 #ifdef __i386__
-#define PC "eip"
+#  define PC "eip"
 #else
-#define PC "rip"
+#  define PC "rip"
 #endif
 
-using std::unique_ptr;
+// -----------------------------------------------------
+// Tool arguments (knobs)
 
-//
-// Tool Arguments
-//
-
-static KNOB<std::string> KnobModuleWhitelist(KNOB_MODE_APPEND, "pintool", "w", "",
+static KNOB<std::string> KnobModuleWhitelist(
+    KNOB_MODE_APPEND, "pintool", "w", "",
     "Add a module to the whitelist. If none is specified, every module is white-listed. Example: calc.exe");
 
-KNOB<std::string> KnobOutputFilePrefix(KNOB_MODE_WRITEONCE, "pintool", "o", "trace",
+static KNOB<std::string> KnobOutputFilePrefix(
+    KNOB_MODE_WRITEONCE, "pintool", "o", "trace",
     "Prefix of the output file. If none is specified, 'trace' is used.");
 
-static KNOB<std::string> KnobImageBase(KNOB_MODE_APPEND, "pintool", "i", "",
+static KNOB<std::string> KnobImageBase(
+    KNOB_MODE_APPEND, "pintool", "i", "",
     "Image base address remapping. Syntax: ImageName:0xBase. Example: -i WowT.exe:0x140000000");
 
-//
-// New knob: traced module name
-//
-// When specified, tracing will begin only after this module (DLL) is
-// loaded into the target process. Only instructions that originate from
-// the selected module will be recorded. This mirrors the TenetTracer
-// `TRACED_MODULE` concept, allowing users to focus on DLLs loaded by
-// an executable rather than the executable itself.
-static KNOB<std::string> KnobTraceModule(KNOB_MODE_WRITEONCE, "pintool", "m", "",
-    "Name of the module (DLL) to trace. When set, tracing does not start until this module is loaded.");
+// Name of a DLL to trace exclusively; tracing starts when it is loaded.
+static KNOB<std::string> KnobTraceModule(
+    KNOB_MODE_WRITEONCE, "pintool", "m", "",
+    "Name of the module (DLL) to trace. Tracing starts when this module loads.");
 
-//
-// Misc / Util
-//
+// -----------------------------------------------------
+// Misc / util
 
-#if defined(TARGET_WINDOWS)
-#define PATH_SEPARATOR "\\"
-#else
-#define PATH_SEPARATOR "/"
-#endif
-
-static std::string base_name(const std::string& path)
+// On x64 Windows ADDRINT fits in unsigned long long.
+static inline unsigned long long asU64(ADDRINT x)
 {
-    std::string::size_type idx = path.rfind(PATH_SEPARATOR);
-    std::string name = (idx == std::string::npos) ? path : path.substr(idx + 1);
-    return name;
+    return static_cast<unsigned long long>(x);
 }
 
-//
-// Per thread data structure. This is mainly done to avoid locking.
-// - Per-thread map of executed basic blocks, and their size.
-//
+// -----------------------------------------------------
+// Per-thread data (lock-free logging per thread)
 
-struct ThreadData
+struct alignas(64) ThreadData
 {
-    ADDRINT m_cpu_pc;
-    ADDRINT m_cpu[REG_GR_LAST + 1];
+    ADDRINT m_cpu_pc{0};
+    std::array<ADDRINT, REG_GR_LAST + 1> m_cpu{}; // zero-inited
 
-    ADDRINT mem_w_addr;
-    ADDRINT mem_w_size;
-    ADDRINT mem_r_addr;
-    ADDRINT mem_r_size;
-    ADDRINT mem_r2_addr;
-    ADDRINT mem_r2_size;
+    ADDRINT mem_w_addr{0}, mem_w_size{0};
+    ADDRINT mem_r_addr{0}, mem_r_size{0};
+    ADDRINT mem_r2_addr{0}, mem_r2_size{0};
 
-    // Map from image name to log stream
-    std::map<std::string, ofstream*> m_image_logs;
+    std::unordered_map<std::string, std::unique_ptr<tenet_tracer::Logger>> m_image_logs;
+    alignas(64) char m_scratch[1024]{};
 
-    char m_scratch[512 * 2]; // fxsave has the biggest memory operand
+    // Optional utility if you want a per-image+tid file under a dir
+    tenet_tracer::Logger& GetOrCreateLogger(const std::string& imageBaseName,
+                                            const std::string& logDir,
+                                            int pid,
+                                            THREADID tid)
+    {
+        if (m_image_logs.empty()) m_image_logs.reserve(32);
+        std::string key(imageBaseName);
+        auto it = m_image_logs.find(key);
+        if (it != m_image_logs.end()) return *(it->second);
+
+        std::ostringstream path;
+        path << logDir << PathUtils::PATH_SEP
+            << PathUtils::SanitizeFilename(imageBaseName)
+            << "_pid" << pid << "_T" << tid << ".log";
+
+        PathUtils::EnsureDirectoryExists(path.str());
+        auto logger = tenet_tracer::LoggerBuilder()
+                      .addFileHandler(path.str(), 10 * 1024 * 1024, false)
+                      .build();
+        logger->setThreadId(static_cast<unsigned>(tid));
+        auto* raw = logger.get();
+        m_image_logs.emplace(std::move(key), std::move(logger));
+        return *raw;
+    }
+
+    void CloseAllLogs()
+    {
+        for (auto& kv : m_image_logs)
+        {
+            if (kv.second) kv.second->close();
+        }
+        m_image_logs.clear();
+    }
 };
 
-//
-// Tool Infrastructure
-//
+// -----------------------------------------------------
+// Tool context
 
 class ToolContext
 {
 public:
-    // Image base as provided by the user (via knob)
-    ADDRINT image_base_;
-
-    // When tracing a specific module (DLL) within the target process, this
-    // field holds the module's base name. If empty, all modules may be traced
-    // depending on the whitelist. See KnobTraceModule and the documentation
-    // on tracing DLLs within an EXE.
-    std::string traced_module;
-
-    // Flag indicating that tracing for the traced_module has started. It
-    // remains false until the specified module is loaded. This ensures
-    // instructions executed before the module is present are not logged.
-    bool m_tracing_started;
-
-    // The image manager allows us to keep track of loaded images.
-    ImageManager* m_images;
-
-    ToolContext() : m_tracing_started(false), m_images(nullptr)
+    ToolContext()
+        : m_tracing_started(false), image_base_(0)
     {
-        // Initialize the image base to the knob value if set
-        if (!KnobImageBase.Value().empty())
-        {
-            image_base_ = std::stoull(KnobImageBase.Value(), nullptr, 16);
-        }
-        else
-        {
-            // Default fallback (0 for no base adjustment)
-            image_base_ = 0;
-        }
+        if (meta_logger) meta_logger->info("Initializing ToolContext before creating ImageManager!");
 
         PIN_InitLock(&m_loaded_images_lock);
         PIN_InitLock(&m_thread_lock);
+        if (meta_logger) meta_logger->info("Initializing ToolContext before getting the thread data key!");
+
         m_tls_key = PIN_CreateThreadDataKey(nullptr);
+        if (meta_logger) meta_logger->info("Initializing ToolContext before creating ImageManager!");
+        m_images = std::make_unique<ImageManager>();
+        if (meta_logger) meta_logger->info("Initializing ToolContext AFTER! creating ImageManager!");
     }
 
-    // Method to return the image base
-    ADDRINT getImageBase() const
-    {
-        return image_base_;
-    }
+    // API
+    ADDRINT image_base() const noexcept { return image_base_; }
 
-    ThreadData* GetThreadLocalData(THREADID tid) const
+    ThreadData* GetThreadLocalData(THREADID tid) const noexcept
     {
         return static_cast<ThreadData*>(PIN_GetThreadData(m_tls_key, tid));
     }
 
-    void setThreadLocalData(THREADID tid, ThreadData* data) const
+    void SetThreadLocalData(THREADID tid, ThreadData* data) const noexcept
     {
         PIN_SetThreadData(m_tls_key, data, tid);
     }
 
-    // Method to find the image base of a given address
-    ADDRINT findImageBaseForAddress(ADDRINT addr) const
+    // Binary search for the image base owning 'addr'. Vector must be sorted by low_.
+    ADDRINT FindImageBaseForAddress(ADDRINT addr) const noexcept
     {
-        for (const auto& img : m_loaded_images)
-        {
-            if (addr >= img.low_ && addr <= img.high_)
-            {
-                return img.low_;
-            }
-        }
-        return 0; // Return 0 if no image base is found for the given address
+        LoadedImage probe("probe", addr, 0, 0);
+        auto it = std::upper_bound(m_loaded_images.begin(), m_loaded_images.end(), probe);
+        if (it == m_loaded_images.begin()) return 0;
+        --it;
+        return (addr >= it->low_ && addr < it->high_) ? it->low_ : 0;
     }
 
-    // Trace file used for 'monolithic' execution traces.
-    //TraceFile* m_trace;
+    void RegisterLoadedImage(ADDRINT low, ADDRINT high, std::string baseName, ADDRINT desired = 0)
+    {
+        PIN_GetLock(&m_loaded_images_lock, 0);
+        m_loaded_images.emplace_back(std::move(baseName), low, high, desired);
+        std::inplace_merge(m_loaded_images.begin(),
+                           m_loaded_images.end() - 1,
+                           m_loaded_images.end());
+        PIN_ReleaseLock(&m_loaded_images_lock);
+    }
 
-    // Keep track of _all_ the loaded images.
-    std::vector<LoadedImage> m_loaded_images;
-    PIN_LOCK m_loaded_images_lock;
+    void OnThreadStart(THREADID tid)
+    {
+        auto* td = new ThreadData();
+        SetThreadLocalData(tid, td);
+        PIN_GetLock(&m_thread_lock, 0);
+        m_seen_threads.insert(tid);
+        PIN_ReleaseLock(&m_thread_lock);
+    }
 
-    // Thread tracking utilities.
+    void OnThreadFini(THREADID tid)
+    {
+        auto* td = GetThreadLocalData(tid);
+        if (td)
+        {
+            td->CloseAllLogs();
+            SetThreadLocalData(tid, nullptr);
+            PIN_GetLock(&m_thread_lock, 0);
+            m_terminated_threads.push_back(td); // freed in Fini()
+            PIN_ReleaseLock(&m_thread_lock);
+        }
+    }
+
+    void Fini()
+    {
+        for (auto* td : m_terminated_threads) delete td;
+        m_terminated_threads.clear();
+    }
+
+    // Traced module controls
+    void SetTracedModule(std::string v) { traced_module_ = std::move(v); }
+    const std::string& TracedModule() const noexcept { return traced_module_; }
+
+    void SetTracingStarted(bool v) noexcept { m_tracing_started = v; }
+    bool TracingStarted() const noexcept { return m_tracing_started; }
+
+    TLS_KEY TlsKey() const noexcept { return m_tls_key; }
+
+    std::unique_ptr<ImageManager> m_images; // your manager
+    std::string log_dir = "logs"; // optional dir for per-image-per-thread logs
+
+    // Global-ish state used by callbacks:
+    std::vector<std::pair<std::string, ADDRINT>> image_base_mappings;
+    bool m_tracing_enabled = true; // disabled until module loads if tracing a specific DLL
+    std::string traced_module_;
+    bool m_tracing_started;
+
+    // Expose lock for rare reads (if you want to lock during read)
+    mutable PIN_LOCK m_loaded_images_lock;
+    std::vector<LoadedImage> m_loaded_images; // kept sorted by low_
+
+    mutable PIN_LOCK m_thread_lock;
     std::set<THREADID> m_seen_threads;
     std::vector<ThreadData*> m_terminated_threads;
-    PIN_LOCK m_thread_lock;
 
-    // Flag that indicates that tracing is enabled. Always true if there are no whitelisted images.
-    bool m_tracing_enabled = true;
-
-    // TLS key used to store per-thread data.
+private:
+    ADDRINT image_base_;
     TLS_KEY m_tls_key;
 
-    // Map of image name to desired base (for rebasing)
-    std::vector<std::pair<std::string, ADDRINT>> image_base_mappings;
+public:
+    std::string GetImageNameForAddress(ADDRINT addr)
+    {
+        // Optional lock for safety (image loads are rare)
+        PIN_GetLock(&this->m_loaded_images_lock, 0);
+        LoadedImage probe("probe", addr, 0, 0);
+        auto it = std::upper_bound(this->m_loaded_images.begin(),
+                                   this->m_loaded_images.end(), probe);
+        if (it == this->m_loaded_images.begin())
+        {
+            PIN_ReleaseLock(&this->m_loaded_images_lock);
+            return "unknown";
+        }
+        --it;
+        if (addr >= it->low_ && addr < it->high_)
+        {
+            std::string name = it->name_;
+            PIN_ReleaseLock(&this->m_loaded_images_lock);
+            return PathUtils::GetBaseName(name);
+        }
+        PIN_ReleaseLock(&this->m_loaded_images_lock);
+        return "unknown";
+    }
+
+
+    ADDRINT RebaseAddress(ADDRINT addr)
+    {
+        PIN_GetLock(&this->m_loaded_images_lock, 0);
+        LoadedImage probe("probe", addr, 0, 0);
+        auto it = std::upper_bound(this->m_loaded_images.begin(),
+                                   this->m_loaded_images.end(), probe);
+        if (it == this->m_loaded_images.begin())
+        {
+            PIN_ReleaseLock(&this->m_loaded_images_lock);
+            return addr;
+        }
+        --it;
+        if (addr >= it->low_ && addr < it->high_)
+        {
+            ADDRINT desired = it->desired_base_;
+            PIN_ReleaseLock(&this->m_loaded_images_lock);
+            return desired ? (addr - it->low_) + desired : addr;
+        }
+        PIN_ReleaseLock(&this->m_loaded_images_lock);
+        return addr;
+    }
 };
 
-// Utility to ensure directory exists for a given file path prefix
-static void ensure_directory_for_prefix(const std::string& prefix)
+// -----------------------------------------------------
+// Global tool context (lives for process lifetime)
+std::unique_ptr<ToolContext> g_context;
+
+// -----------------------------------------------------
+// Helpers
+
+
+static bool ParseImageBaseMapping(const std::string& s, std::string& name, ADDRINT& base)
 {
-    size_t pos = prefix.find_last_of("/\\");
-    if (pos == std::string::npos) return;
-    std::string dir = prefix.substr(0, pos);
-    if (dir.empty()) return;
-
-    // Create directories recursively by building up the path
-    size_t start = 0;
-    while (true)
-    {
-        size_t sep = dir.find_first_of("/\\", start);
-        std::string subdir = dir.substr(0, sep);
-        if (!subdir.empty())
-        {
-            mkdir(subdir.c_str(), 0755);
-        }
-        if (sep == std::string::npos) break;
-        start = sep + 1;
-    }
-}
-
-// Utility to get image name for an address
-static std::string get_image_name_for_address(const ToolContext& context, ADDRINT addr)
-{
-    for (size_t i = 0; i < context.m_loaded_images.size(); ++i)
-    {
-        const LoadedImage& img = context.m_loaded_images[i];
-        if (addr >= img.low_ && addr < img.high_)
-        {
-            return base_name(img.name_);
-        }
-    }
-    return "unknown";
-}
-
-// Thread creation event handler.
-static VOID OnThreadStart(THREADID tid, CONTEXT* ctxt, INT32 flags, VOID* v)
-{
-    auto& context = *static_cast<ToolContext*>(v);
-    auto data = new ThreadData;
-    // Don't use memset as it destroys the std::map constructor!
-    // Instead, manually initialize the primitive members
-    data->m_cpu_pc = 0;
-    for (int i = 0; i <= REG_GR_LAST; ++i) {
-        data->m_cpu[i] = 0;
-    }
-    data->mem_w_addr = 0;
-    data->mem_w_size = 0;
-    data->mem_r_addr = 0;
-    data->mem_r_size = 0;
-    data->mem_r2_addr = 0;
-    data->mem_r2_size = 0;
-    memset(data->m_scratch, 0, sizeof(data->m_scratch));
-    // m_image_logs is a std::map and will be initialized by its constructor
-
-    context.setThreadLocalData(tid, data);
-    PIN_GetLock(&context.m_thread_lock, 1);
-    {
-        context.m_seen_threads.insert(tid);
-    }
-    PIN_ReleaseLock(&context.m_thread_lock);
-}
-
-// Thread destruction event handler.
-static VOID OnThreadFini(THREADID tid, const CONTEXT* ctxt, INT32 c, VOID* v)
-{
-    auto& context = *static_cast<ToolContext*>(v);
-    ThreadData* data = context.GetThreadLocalData(tid);
-    for (auto it = data->m_image_logs.begin(); it != data->m_image_logs.end(); ++it)
-    {
-        if (it->second)
-        {
-            it->second->close();
-            delete it->second;
-        }
-    }
-    data->m_image_logs.clear();
-    PIN_GetLock(&context.m_thread_lock, 1);
-    {
-        context.m_seen_threads.erase(tid);
-        context.m_terminated_threads.push_back(data);
-    }
-    PIN_ReleaseLock(&context.m_thread_lock);
-}
-
-// Utility to parse ImageName:0xBase from knob value
-static bool parse_image_base_mapping(const std::string& s, std::string& name, ADDRINT& base)
-{
-    size_t pos = s.find(":");
+    size_t pos = s.find(':');
     if (pos == std::string::npos) return false;
     name = s.substr(0, pos);
     std::string base_str = s.substr(pos + 1);
     base = 0;
-    if (base_str.size() > 2 && (base_str[0] == '0' && (base_str[1] == 'x' || base_str[1] == 'X')))
+    if (base_str.size() > 2 && base_str[0] == '0' && (base_str[1] == 'x' || base_str[1] == 'X'))
         base = strtoull(base_str.c_str(), nullptr, 16);
     else
         base = strtoull(base_str.c_str(), nullptr, 10);
     return true;
 }
 
-// Image load event handler.
+
+// -----------------------------------------------------
+// Thread lifecycle
+
+static VOID OnThreadStart(THREADID tid, CONTEXT*, INT32, VOID* v)
+{
+    static_cast<ToolContext*>(v)->OnThreadStart(tid);
+}
+
+static VOID OnThreadFini(THREADID tid, const CONTEXT*, INT32, VOID* v)
+{
+    static_cast<ToolContext*>(v)->OnThreadFini(tid);
+}
+
+// -----------------------------------------------------
+// Image load/unload
+
 static VOID OnImageLoad(IMG img, VOID* v)
 {
     auto& context = *static_cast<ToolContext*>(v);
-    std::string img_name = base_name(IMG_Name(img));
+    std::string img_name = PathUtils::GetBaseName(IMG_Name(img));
     ADDRINT low = IMG_LowAddress(img);
     ADDRINT high = IMG_HighAddress(img);
     ADDRINT desired_base = 0;
-    // Look for mapping
-    for (size_t i = 0; i < context.image_base_mappings.size(); ++i)
+
+    for (const auto& kv : context.image_base_mappings)
     {
-        if (context.image_base_mappings[i].first == img_name)
+        if (kv.first == img_name)
         {
-            desired_base = context.image_base_mappings[i].second;
+            desired_base = kv.second;
             break;
         }
     }
 
-    // Write to meta log with detailed rebasing info
-    if (meta_log)
+    if (meta_logger)
     {
-        if (desired_base != 0)
+        if (desired_base)
         {
-            ADDRINT rebased_high = (high - low) + desired_base;
-            *meta_log << "Loaded image: " << img_name << " with range 0x" << std::hex << low << ":0x" << high
-                << " and rebasing it to 0x" << desired_base << ":0x" << rebased_high << std::endl;
+            meta_logger->infof("Loaded image: %s range=[0x%llx:0x%llx] rebase->[0x%llx:0x%llx]",
+                               img_name.c_str(),
+                               asU64(low), asU64(high),
+                               asU64(desired_base), asU64((high - low) + desired_base));
         }
         else
         {
-            *meta_log << "Loaded image: " << img_name << " with range 0x" << std::hex << low << ":0x" << high
-                << " (no rebasing)" << std::endl;
+            meta_logger->infof("Loaded image: %s range=[0x%llx:0x%llx] (no rebasing)",
+                               img_name.c_str(), asU64(low), asU64(high));
         }
     }
+    
 
-    // Write to main log with rebased range (or original if no rebasing)
-    if (desired_base != 0)
-    {
-        ADDRINT rebased_high = (high - low) + desired_base;
-        *g_log << "Loaded image: 0x" << std::hex << desired_base << ":0x" << rebased_high << " -> " << img_name << std::endl;
-    }
-    else
-    {
-        *g_log << "Loaded image: 0x" << std::hex << low << ":0x" << high << " -> " << img_name << std::endl;
-    }
+    context.RegisterLoadedImage(low, high, img_name, desired_base);
 
-    PIN_GetLock(&context.m_loaded_images_lock, 1);
+    // traced-module-only mode
+    if (!context.traced_module_.empty())
     {
-        context.m_loaded_images.push_back(LoadedImage(IMG_Name(img), low, high, desired_base));
-    }
-    PIN_ReleaseLock(&context.m_loaded_images_lock);
-
-    // If a traced module name was specified, enable tracing only when it is loaded
-    if (!context.traced_module.empty())
-    {
-        // compare case sensitive; the user should pass the exact base name
-        if (img_name == context.traced_module)
+        if (img_name == context.traced_module_)
         {
             context.m_images->addImage(img_name, low, high, desired_base);
             context.m_tracing_enabled = true;
             context.m_tracing_started = true;
-            if (meta_log)
-            {
-                *meta_log << "Tracing started for module: " << img_name << std::endl;
-            }
+            if (meta_logger) meta_logger->infof("Tracing started for module: %s", img_name.c_str());
         }
-        // Do not add any other images to the ImageManager if a traced module is specified.
         return;
     }
 
-    // Fall back to whitelist logic when no specific module is targeted
+    // whitelist mode
     if (context.m_images->isWhiteListed(img_name))
     {
         context.m_images->addImage(img_name, low, high, desired_base);
-        if (!context.m_tracing_enabled)
-            context.m_tracing_enabled = true;
+        if (!context.m_tracing_enabled) context.m_tracing_enabled = true;
     }
 }
 
-// Image unload event handler.
 static VOID OnImageUnload(IMG img, VOID* v)
 {
     auto& context = *static_cast<ToolContext*>(v);
     context.m_images->removeImage(IMG_LowAddress(img));
+    // Optional: also erase from m_loaded_images if you want exact accuracy.
 }
 
-//
+// -----------------------------------------------------
 // Tracing
-//
-
-static ADDRINT rebase_address(const ToolContext& context, ADDRINT addr)
-{
-    // Find which loaded image this address belongs to
-    for (size_t i = 0; i < context.m_loaded_images.size(); ++i)
-    {
-        const LoadedImage& img = context.m_loaded_images[i];
-        if (addr >= img.low_ && addr < img.high_)
-        {
-            // See if a desired base is set
-            if (img.desired_base_ != 0)
-            {
-                return (addr - img.low_) + img.desired_base_;
-            }
-            break;
-        }
-    }
-    // No rebase
-    return addr;
-}
-
-// Utility to sanitize image name for file name
-static std::string sanitize_image_name(const std::string& name)
-{
-    std::string out;
-    for (size_t i = 0; i < name.size(); ++i)
-    {
-        char c = name[i];
-        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_')
-        {
-            out += c;
-        }
-        else
-        {
-            out += '_';
-        }
-    }
-    return out;
-}
 
 static VOID record_diff(const CONTEXT* cpu, ADDRINT pc, VOID* v)
 {
     auto& context = *static_cast<ToolContext*>(v);
-    // Only proceed if tracing is enabled and the address is interesting
-    if (!context.m_tracing_enabled || !context.m_images->isInterestingAddress(pc))
-        return;
-    auto tid = PIN_ThreadId();
+    if (!context.m_tracing_enabled || !context.m_images->isInterestingAddress(pc)) return;
+
+    THREADID tid = PIN_ThreadId();
     ThreadData* data = context.GetThreadLocalData(tid);
-    if (!data)
-        return;
+    if (!data) return;
 
-    // Determine image name for current PC
-    std::string image_name = get_image_name_for_address(context, pc);
-    std::string sanitized_image_name = sanitize_image_name(image_name);
-
-    // Open log file for this image/thread if not already open
-    ofstream* out_file = nullptr;
-    if (data->m_image_logs.count(sanitized_image_name) == 0)
+    // Per-image logger (file per thread per image)
+    std::string image_name = context.GetImageNameForAddress(pc);
+    std::string sanitized_image_name;
+    sanitized_image_name.reserve(image_name.size());
+    for (size_t i = 0; i < image_name.size(); ++i)
     {
-        // Compose file name: prefix.sanitizedimagename_tid.log
+        char c = image_name[i];
+        sanitized_image_name += ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_')
+                                    ? c
+                                    : '_';
+    }
+
+    tenet_tracer::Logger* out_logger = nullptr;
+    auto it = data->m_image_logs.find(sanitized_image_name);
+    if (it == data->m_image_logs.end())
+    {
         std::string prefix = KnobOutputFilePrefix.Value();
-        ensure_directory_for_prefix(prefix);
-        char filename[512] = {};
-        sprintf(filename, "%s.%s_%u.log", prefix.c_str(), sanitized_image_name.c_str(), tid);
-        out_file = new ofstream;
-        out_file->open(filename);
-        if (!out_file || !out_file->is_open())
+        PathUtils::EnsureDirectoryExists(prefix);
+        // prefix.<image>.log ; handler will NOT append tid (we include tid in name below if desired)
+        std::string baseFilename = prefix + "." + sanitized_image_name + ".log";
+        auto loggerPtr = tenet_tracer::LoggerBuilder()
+                         .addFileHandler(
+                            baseFilename, 
+                            0 /* do not roll over */,
+                            true /*appendThreadId*/,
+                            false /* no level prefix */)
+                         .build();
+        loggerPtr->setThreadId(static_cast<unsigned>(tid));
+        if (meta_logger)
         {
-            if (g_log)
-            {
-                *g_log << "[ERROR] Failed to open log file: " << filename << " for image '" << image_name << "' (tid "
-                    << tid << ")" << std::endl;
-            }
-            delete out_file;
-            return;
+            meta_logger->infof("Opened log file: %s for image '%s' (tid %u)",
+                               baseFilename.c_str(), image_name.c_str(), static_cast<unsigned>(tid));
         }
-        if (meta_log)
-        {
-            *meta_log << "[INFO] Opened log file: " << filename << " for image '" << image_name << "' (tid " << tid << ")"
-                << std::endl;
-        }
-        *out_file << std::hex;
-        data->m_image_logs[sanitized_image_name] = out_file;
+        out_logger = loggerPtr.get();
+        data->m_image_logs[sanitized_image_name] = std::move(loggerPtr);
     }
     else
     {
-        out_file = data->m_image_logs[sanitized_image_name];
+        out_logger = it->second.get();
     }
+    if (!out_logger) return;
 
-    // Defensive check before writing
-    if (!out_file || !out_file->is_open())
-        return;
+    // Build entry
+    std::ostringstream oss;
+    oss << std::hex;
 
-    // Dump register delta
+    // Register deltas
     ADDRINT val = 0;
-    int cpu_size = sizeof(data->m_cpu) / sizeof(data->m_cpu[0]);
-    for (int reg = REG_GR_BASE; reg <= static_cast<int>(REG_GR_LAST); ++reg)
+    const int cpu_size = static_cast<int>(data->m_cpu.size());
+    for (int r = static_cast<int>(REG_GR_BASE); r <= static_cast<int>(REG_GR_LAST); ++r)
     {
-        int reg_idx = reg - static_cast<int>(REG_GR_BASE);
-        if (reg_idx < 0 || reg_idx >= cpu_size)
-            continue;
-        PIN_GetContextRegval(cpu, static_cast<REG>(reg), reinterpret_cast<UINT8*>(&val));
-        if (val == data->m_cpu[reg])
-            continue;
-        *out_file << REG_StringShort(static_cast<REG>(reg)) << "=0x" << val << ",";
-        data->m_cpu[reg] = val;
+        const int reg_idx = r - static_cast<int>(REG_GR_BASE);
+        if (reg_idx < 0 || reg_idx >= cpu_size) continue;
+
+        PIN_GetContextRegval(cpu, static_cast<REG>(r), reinterpret_cast<UINT8*>(&val));
+        if (val == data->m_cpu[reg_idx]) continue;
+
+        oss << REG_StringShort(static_cast<REG>(r)) << "=0x" << val << ",";
+        data->m_cpu[reg_idx] = val;
     }
 
-    // Use rebasing for PC
-    ADDRINT adjusted_pc = rebase_address(context, pc);
-    *out_file << PC << "=0x" << adjusted_pc;
+    // PC (rebased if needed)
+    ADDRINT adjusted_pc = context.RebaseAddress(pc);
+    oss << PC << "=0x" << adjusted_pc;
 
-    // Memory read/write logs
+    // Memory reads/writes (dump bytes)
     if (data->mem_r_size)
     {
-        memset(data->m_scratch, 0, data->mem_r_size);
+        std::memset(data->m_scratch, 0, data->mem_r_size);
         PIN_SafeCopy(data->m_scratch, reinterpret_cast<const void*>(data->mem_r_addr), data->mem_r_size);
-        ADDRINT adjusted_mem_r_addr = rebase_address(context, data->mem_r_addr);
-        *out_file << ",mr=0x" << adjusted_mem_r_addr << ":";
-        for (UINT32 i = 0; i < data->mem_r_size; i++)
-        {
-            *out_file << std::hex << std::setw(2) << std::setfill('0') << (static_cast<unsigned char>(data->m_scratch[i])
-                & 0xff);
-        }
+        ADDRINT a = context.RebaseAddress(data->mem_r_addr);
+        oss << ",mr=0x" << a << ":";
+        for (UINT32 i = 0; i < data->mem_r_size; ++i)
+            oss << std::setw(2) << std::setfill('0') << (static_cast<unsigned>(static_cast<unsigned char>(data->
+                m_scratch[i])) & 0xff);
         data->mem_r_size = 0;
     }
     if (data->mem_r2_size)
     {
-        memset(data->m_scratch, 0, data->mem_r2_size);
+        std::memset(data->m_scratch, 0, data->mem_r2_size);
         PIN_SafeCopy(data->m_scratch, reinterpret_cast<const void*>(data->mem_r2_addr), data->mem_r2_size);
-        ADDRINT adjusted_mem_r2_addr = rebase_address(context, data->mem_r2_addr);
-        *out_file << ",mr=0x" << adjusted_mem_r2_addr << ":";
-        for (UINT32 i = 0; i < data->mem_r2_size; i++)
-        {
-            *out_file << std::hex << std::setw(2) << std::setfill('0') << (static_cast<unsigned char>(data->m_scratch[i])
-                & 0xff);
-        }
+        ADDRINT a = context.RebaseAddress(data->mem_r2_addr);
+        oss << ",mr=0x" << a << ":";
+        for (UINT32 i = 0; i < data->mem_r2_size; ++i)
+            oss << std::setw(2) << std::setfill('0') << (static_cast<unsigned>(static_cast<unsigned char>(data->
+                m_scratch[i])) & 0xff);
         data->mem_r2_size = 0;
     }
     if (data->mem_w_size)
     {
-        memset(data->m_scratch, 0, data->mem_w_size);
+        std::memset(data->m_scratch, 0, data->mem_w_size);
         PIN_SafeCopy(data->m_scratch, reinterpret_cast<const void*>(data->mem_w_addr), data->mem_w_size);
-        ADDRINT adjusted_mem_w_addr = rebase_address(context, data->mem_w_addr);
-        *out_file << ",mw=0x" << adjusted_mem_w_addr << ":";
-        for (UINT32 i = 0; i < data->mem_w_size; i++)
-        {
-            *out_file << std::hex << std::setw(2) << std::setfill('0') << (static_cast<unsigned char>(data->m_scratch[i])
-                & 0xff);
-        }
+        ADDRINT a = context.RebaseAddress(data->mem_w_addr);
+        oss << ",mw=0x" << a << ":";
+        for (UINT32 i = 0; i < data->mem_w_size; ++i)
+            oss << std::setw(2) << std::setfill('0') << (static_cast<unsigned>(static_cast<unsigned char>(data->
+                m_scratch[i])) & 0xff);
         data->mem_w_size = 0;
     }
-    *out_file << std::endl;
+
+    out_logger->log(oss.str());
 }
 
-VOID record_read(THREADID tid, ADDRINT access_addr, UINT32 access_size, VOID* v)
+static VOID record_read(THREADID tid, ADDRINT access_addr, UINT32 access_size, VOID* v)
 {
-    auto& context = *static_cast<ToolContext*>(v);
-    ThreadData* data = context.GetThreadLocalData(tid);
+    ThreadData* data = static_cast<ToolContext*>(v)->GetThreadLocalData(tid);
+    if (!data) return;
     data->mem_r_addr = access_addr;
     data->mem_r_size = access_size;
 }
 
-VOID record_read2(THREADID tid, ADDRINT access_addr, UINT32 access_size, VOID* v)
+static VOID record_read2(THREADID tid, ADDRINT access_addr, UINT32 access_size, VOID* v)
 {
-    auto& context = *static_cast<ToolContext*>(v);
-    ThreadData* data = context.GetThreadLocalData(tid);
+    ThreadData* data = static_cast<ToolContext*>(v)->GetThreadLocalData(tid);
+    if (!data) return;
     data->mem_r2_addr = access_addr;
     data->mem_r2_size = access_size;
 }
 
-VOID record_write(THREADID tid, ADDRINT access_addr, UINT32 access_size, VOID* v)
+static VOID record_write(THREADID tid, ADDRINT access_addr, UINT32 access_size, VOID* v)
 {
-    auto& context = *static_cast<ToolContext*>(v);
-    ThreadData* data = context.GetThreadLocalData(tid);
+    ThreadData* data = static_cast<ToolContext*>(v)->GetThreadLocalData(tid);
+    if (!data) return;
     data->mem_w_addr = access_addr;
     data->mem_w_size = access_size;
 }
 
-VOID OnInst(INS ins, VOID* v)
+static VOID OnInst(INS ins, VOID* v)
 {
-    //
-    // *always* dump a diff since the last instruction
-    //
+    // Always dump diff
+    INS_InsertCall(ins, IPOINT_BEFORE, AFUNPTR(record_diff),
+                   IARG_CONST_CONTEXT,
+                   IARG_INST_PTR,
+                   IARG_PTR, v,
+                   IARG_END);
 
-    INS_InsertCall(
-        ins, IPOINT_BEFORE,
-        AFUNPTR(record_diff),
-        IARG_CONST_CONTEXT,
-        IARG_INST_PTR,
-        IARG_PTR, v,
-        IARG_END);
-
-    //
-    // if this instruction will perform a mem r/w, inject a call to record the
-    // address of interest. this will be used by the *next* state diff / dump
-    //
-
-    if (INS_IsMemoryRead(ins) || INS_IsMemoryWrite(ins))
+    // If instruction uses memory, capture addresses/sizes
+    if (INS_IsMemoryRead(ins))
     {
-        if (INS_IsMemoryRead(ins))
-        {
-            INS_InsertCall(
-                ins, IPOINT_BEFORE,
-                AFUNPTR(record_read),
-                IARG_THREAD_ID,
-                IARG_MEMORYREAD_EA,
-                IARG_MEMORYREAD_SIZE,
-                IARG_PTR, v,
-                IARG_END);
-        }
-
-        if (INS_HasMemoryRead2(ins))
-        {
-            //assert(INS_IsMemoryRead(ins) == false);
-            INS_InsertCall(
-                ins, IPOINT_BEFORE,
-                AFUNPTR(record_read2),
-                IARG_THREAD_ID,
-                IARG_MEMORYREAD2_EA,
-                IARG_MEMORYREAD_SIZE,
-                IARG_PTR, v,
-                IARG_END);
-        }
-
-        if (INS_IsMemoryWrite(ins))
-        {
-            INS_InsertCall(
-                ins, IPOINT_BEFORE,
-                AFUNPTR(record_write),
-                IARG_THREAD_ID,
-                IARG_MEMORYWRITE_EA,
-                IARG_MEMORYWRITE_SIZE,
-                IARG_PTR, v,
-                IARG_END);
-        }
+        INS_InsertCall(ins, IPOINT_BEFORE, AFUNPTR(record_read),
+                       IARG_THREAD_ID,
+                       IARG_MEMORYREAD_EA,
+                       IARG_MEMORYREAD_SIZE,
+                       IARG_PTR, v,
+                       IARG_END);
+    }
+    if (INS_HasMemoryRead2(ins))
+    {
+        INS_InsertCall(ins, IPOINT_BEFORE, AFUNPTR(record_read2),
+                       IARG_THREAD_ID,
+                       IARG_MEMORYREAD2_EA,
+                       IARG_MEMORYREAD_SIZE,
+                       IARG_PTR, v,
+                       IARG_END);
+    }
+    if (INS_IsMemoryWrite(ins))
+    {
+        INS_InsertCall(ins, IPOINT_BEFORE, AFUNPTR(record_write),
+                       IARG_THREAD_ID,
+                       IARG_MEMORYWRITE_EA,
+                       IARG_MEMORYWRITE_SIZE,
+                       IARG_PTR, v,
+                       IARG_END);
     }
 }
 
-static VOID Fini(INT32 code, VOID* v)
+// -----------------------------------------------------
+// Shutdown & exceptions
+
+static VOID Fini(INT32, VOID* v)
 {
     auto& context = *static_cast<ToolContext*>(v);
-    for (THREADID i : context.m_seen_threads)
+
+    // Move any surviving TDs to terminated list
+    for (THREADID tid : context.m_seen_threads)
     {
-        ThreadData* data = context.GetThreadLocalData(i);
-        context.m_terminated_threads.push_back(data);
-    }
-    for (const auto& data : context.m_terminated_threads)
-    {
-        for (std::map<std::string, ofstream*>::const_iterator it = data->m_image_logs.begin(); it != data->m_image_logs.
-            end(); ++it)
+        if (auto* data = context.GetThreadLocalData(tid))
         {
-            if (it->second)
-            {
-                it->second->close();
-                delete it->second;
-            }
+            context.m_terminated_threads.push_back(data);
+            context.SetThreadLocalData(tid, nullptr);
         }
     }
-    g_log->close();
-    if (meta_log) {
-        meta_log->close();
-        delete meta_log;
+
+    // Close & free
+    for (auto* data : context.m_terminated_threads)
+    {
+        if (data)
+        {
+            data->CloseAllLogs();
+            delete data;
+        }
     }
+    context.m_terminated_threads.clear();
 }
+
+static EXCEPT_HANDLING_RESULT ExceptionHandler(THREADID /*tid*/, EXCEPTION_INFO* pExceptInfo,
+                                               PHYSICAL_CONTEXT*, VOID*)
+{
+    EXCEPTION_CODE c = PIN_GetExceptionCode(pExceptInfo);
+    EXCEPTION_CLASS cl = PIN_GetExceptionClass(c);
+    std::cerr << "Exception class " << cl << " : " << PIN_ExceptionToString(pExceptInfo) << std::endl;
+    if (meta_logger)
+        meta_logger->errorf("Exception occurred class %u : %s",
+                            static_cast<unsigned>(cl),
+                            PIN_ExceptionToString(pExceptInfo).c_str());
+    return EHR_UNHANDLED;
+}
+
+// -----------------------------------------------------
+// Usage
+
+static INT32 Usage()
+{
+    std::cerr << "This tool logs register deltas and memory accesses per thread/module.\n\n";
+    std::cerr << KNOB_BASE::StringKnobSummary() << std::endl;
+    return -1;
+}
+
+// -----------------------------------------------------
+// Entry point
 
 int main(int argc, char* argv[])
 {
-    // Initialize symbol processing
     PIN_InitSymbols();
 
-    // Initialize PIN.
-    if (PIN_Init(argc, argv))
-    {
-        std::cerr << "Error initializing PIN, PIN_Init failed!" << std::endl;
-        return -1;
-    }
+    if (PIN_Init(argc, argv)) return Usage();
 
-    auto logFile = KnobOutputFilePrefix.Value() + ".log";
-    g_log = new ofstream;
-    g_log->open(logFile.c_str());
-    *g_log << std::hex;
+    PIN_AddInternalExceptionHandler(ExceptionHandler, nullptr);
 
-    auto metaFile = KnobOutputFilePrefix.Value() + ".meta.txt";
-    meta_log = new ofstream;
-    meta_log->open(metaFile.c_str());
+    // Global logs (rotated at 10MB)
+    const auto logFile = KnobOutputFilePrefix.Value() + ".log";
+    const auto metaFile = KnobOutputFilePrefix.Value() + ".meta.txt";
 
-    // Initialize the tool context
-    auto context = new ToolContext();
-    context->m_images = new ImageManager();
+    meta_logger = tenet_tracer::LoggerBuilder()
+                  .addFileHandler(metaFile, 10 * 1024 * 1024, false)
+                  .build();
 
-    // Store the traced module name from the knob into the context. This must be
-    // done after the context is created and knobs are parsed. The value is the
-    // base name of the DLL that should be traced exclusively.
+
+    meta_logger->infof("Trace logs are written to: %s", logFile.c_str());
+    meta_logger->infof("Metadata logging to: %s", metaFile.c_str());
+
+    // Global tool context
+    g_context = std::make_unique<ToolContext>();
+    meta_logger->info("Tool context initialized");
+
+    // Traced module mode
     if (!KnobTraceModule.Value().empty())
     {
-        context->traced_module = KnobTraceModule.Value();
-        // When a traced module is specified, disable tracing initially to
-        // suppress logging until the module is loaded. This parallels TenetTracer's
-        // behaviour of deferring tracing until the DLL appears.
-        context->m_tracing_enabled = false;
-        if (meta_log)
-        {
-            *meta_log << "Specified traced module: " << context->traced_module << std::endl;
-        }
+        g_context->traced_module_ = KnobTraceModule.Value();
+        g_context->m_tracing_enabled = false; // start disabled until module loads
+        if (meta_logger)
+            meta_logger->infof("Specified traced module: %s", g_context->traced_module_.c_str());
     }
 
+    meta_logger->info("Configuration complete");
+
+    // Whitelist modules
     for (unsigned i = 0; i < KnobModuleWhitelist.NumberOfValues(); ++i)
     {
-        if (meta_log)
-            *meta_log << "White-listing image: " << KnobModuleWhitelist.Value(i) << '\n';
-        context->m_images->addWhiteListedImage(KnobModuleWhitelist.Value(i));
-        context->m_tracing_enabled = false;
+        const std::string name = KnobModuleWhitelist.Value(i);
+        if (meta_logger) meta_logger->infof("White-listing image: %s", name.c_str());
+        g_context->m_images->addWhiteListedImage(name);
+        g_context->m_tracing_enabled = false; // enable only when first whitelisted image loads
     }
 
-    // Parse image base mappings from knob
+    // Image base remaps
     for (unsigned i = 0; i < KnobImageBase.NumberOfValues(); ++i)
     {
-        std::string val = KnobImageBase.Value(i);
-        std::string name;
+        std::string val = KnobImageBase.Value(i), name;
         ADDRINT base = 0;
-        if (parse_image_base_mapping(val, name, base))
+        if (ParseImageBaseMapping(val, name, base))
         {
-            context->image_base_mappings.push_back(std::make_pair(name, base));
-            if (meta_log)
-                *meta_log << "Image base mapping: " << name << ":0x" << std::hex << base << std::endl;
+            g_context->image_base_mappings.emplace_back(name, base);
+            if (meta_logger)
+                meta_logger->infof("Image base mapping: %s:0x%llx",
+                                   name.c_str(), asU64(base));
         }
     }
 
-    // Handlers for thread creation and destruction.
-    PIN_AddThreadStartFunction(OnThreadStart, context);
-    PIN_AddThreadFiniFunction(OnThreadFini, context);
+    // Register callbacks (pass raw ptr for v)
+    PIN_AddThreadStartFunction(OnThreadStart, g_context.get());
+    PIN_AddThreadFiniFunction(OnThreadFini, g_context.get());
 
-    // Handlers for image loading and unloading.
-    IMG_AddInstrumentFunction(OnImageLoad, context);
-    IMG_AddUnloadFunction(OnImageUnload, context);
+    IMG_AddInstrumentFunction(OnImageLoad, g_context.get());
+    IMG_AddUnloadFunction(OnImageUnload, g_context.get());
 
-    // Handlers for instrumentation events.
-    INS_AddInstrumentFunction(OnInst, context);
+    INS_AddInstrumentFunction(OnInst, g_context.get());
 
-    // Handler for program exits.
-    PIN_AddFiniFunction(Fini, context);
+    PIN_AddFiniFunction(Fini, g_context.get());
 
+    // Run the target (never returns)
     PIN_StartProgram();
     return 0;
 }

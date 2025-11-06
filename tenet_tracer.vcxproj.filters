@@ -10,6 +10,12 @@
     <Filter Include="src">
       <UniqueIdentifier>{49b3f114-34c8-44e9-92f8-af8742d5ddee}</UniqueIdentifier>
     </Filter>
+    <Filter Include="vendor">
+      <UniqueIdentifier>{d8f93fdb-bef9-47a6-8f98-1bcf04a7d726}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="vendor\sqlite">
+      <UniqueIdentifier>{f26c959a-51c0-4697-b6bd-ac44e2c5e699}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="include\ImageManager.h">
@@ -21,6 +27,18 @@
     <ClInclude Include="include\PinLocker.h">
       <Filter>include</Filter>
     </ClInclude>
+    <ClInclude Include="include\PathUtils.h">
+      <Filter>include</Filter>
+    </ClInclude>
+    <ClInclude Include="vendor\sqlite-3.51.0\sqlite3.h">
+      <Filter>vendor\sqlite</Filter>
+    </ClInclude>
+    <ClInclude Include="vendor\sqlite-3.51.0\sqlite3ext.h">
+      <Filter>vendor\sqlite</Filter>
+    </ClInclude>
+    <ClInclude Include="SqliteLogHandler.h">
+      <Filter>include</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\ImageManager.cpp">
@@ -28,6 +46,9 @@
     </ClCompile>
     <ClCompile Include="src\tenet_tracer.cpp">
       <Filter>src</Filter>
+    </ClCompile>
+    <ClCompile Include="vendor\sqlite-3.51.0\sqlite3.c">
+      <Filter>vendor\sqlite</Filter>
     </ClCompile>
   </ItemGroup>
 </Project>

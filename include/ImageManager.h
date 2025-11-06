@@ -1,11 +1,7 @@
 ﻿#pragma once
 #include "pin.H"
-#include <unistd.h>
 #include <string>
 #include <set>
-
-
-
 
 
 struct LoadedImage {
@@ -14,8 +10,8 @@ struct LoadedImage {
     ADDRINT high_;
     ADDRINT desired_base_;
 
-    LoadedImage(const std::string& n = "", ADDRINT low = 0, ADDRINT high = 0, ADDRINT desired_base = 0)
-        : name_(n)
+    LoadedImage(std::string n = "", ADDRINT low = 0, ADDRINT high = 0, ADDRINT desired_base = 0)
+        : name_(std::move(n))
         , low_(low)
         , high_(high)
         , desired_base_(desired_base)
