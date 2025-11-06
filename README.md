@@ -4,6 +4,26 @@ A Pin Tool for tracing instructions specifically for [tenet](https://github.com/
 
 A special thank you to [hasherezade](https://github.com/hasherezade)'s [tiny_tracer](https://github.com/hasherezade/tiny_tracer) of which this tool is generously built on.
 
+## How to Run
+
+```powershell
+# Remove any previous trace or metadata files before starting a new trace session
+Remove-Item -Path trace.db, trace.db-shm, trace.db-wal, trace.meta.txt -ErrorAction SilentlyContinue; `
+# Run Intel Pin with the Tenet Tracer tool.
+#   -o:      Output prefix/directory for the trace
+#   -i:      Specify rebase address for each image (case sensitive!)
+#   -w:      Only log activity for these modules (must match on case)
+#   --:      Arguments after this go to the target program
+& "C:\pin\pin.exe" -t "C:\pin\source\tools\tenet_tracer\x64\Release\tenet_tracer.dll" `
+    -o F:\output\trace `
+    -i "notepad.exe:0x140000000" `   # Specify rebase address for notepad.exe
+    -i "ntdll.dll:0x180000000" `     # These are case sensitive!
+    -w "notepad.exe" `               # Only log notepad.exe activity
+    -w "ntdll.dll" `
+    -w "CoreMessagingXP.dll" `       # note the capitalization (it must match!)
+    -- C:\Windows\System32\notepad.exe
+```
+
 ## TRACE FORMAT
 
 - Input:  `reg=0xval,reg=0xval,rip=0xpc,mr=0xaddr:hexbytes,mw=0xaddr:hexbytes`
