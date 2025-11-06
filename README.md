@@ -6,9 +6,9 @@ A special thank you to [hasherezade](https://github.com/hasherezade)'s [tiny_tra
 
 ## TRACE FORMAT
 
-Input:  `reg=0xval,reg=0xval,rip=0xpc,mr=0xaddr:hexbytes,mw=0xaddr:hexbytes`
-Stored: `timestamp(int), tid(int), pc(int), registers(json), mem_reads(json), mem_writes(json)`
-Output: Same as input (via [`scripts/dump_trace_db.py`](./scripts/dump_trace_db.py))
+- Input:  `reg=0xval,reg=0xval,rip=0xpc,mr=0xaddr:hexbytes,mw=0xaddr:hexbytes`
+- Stored: `timestamp(int), tid(int), pc(int), registers(json), mem_reads(json), mem_writes(json)`
+- Output: Same as input (via [`scripts/dump_trace_db.py`](./scripts/dump_trace_db.py))
 
 ### Real Trace Example
 
