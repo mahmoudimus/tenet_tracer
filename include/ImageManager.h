@@ -1,9 +1,11 @@
 ﻿#pragma once
 #include "pin.H"
-#include "PinLocker.h"
+#include "Concurrency.h"
 #include <string>
 #include <set>
 
+namespace tenet_tracer {
+namespace imgmgr {
 
 struct LoadedImage
 {
@@ -38,7 +40,7 @@ class ImageManager
 private:
     // Set of module names that are allowed to be traced.
     std::set<LoadedImage> images;
-    PinRwMutex images_lock;
+    tenet_tracer::concurrency::PinRwMutex images_lock;
 
     // Here we store the names of the images inside our white list.
     std::set<std::string> whitelist;
@@ -126,3 +128,6 @@ public:
         }
     }
 };
+
+} // namespace imgmgr
+} // namespace tenet_tracer
