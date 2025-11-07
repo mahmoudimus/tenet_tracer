@@ -436,11 +436,12 @@ _SECURE_SCL=0;_WINDOWS_H_PATH_=$(WindowsSdkDir)Include\$(WindowsTargetPlatformVe
     <ClInclude Include="include\ImageManager.h" />
     <ClInclude Include="include\Logger.h" />
     <ClInclude Include="include\PathUtils.h" />
-    <ClInclude Include="include\PinLocker.h" />
+    <ClInclude Include="include\Concurrency.h" />
     <ClInclude Include="SqliteLogHandler.h">
       <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|x64'">true</ExcludedFromBuild>
       <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">true</ExcludedFromBuild>
     </ClInclude>
+    <ClInclude Include="vendor\json.hpp" />
     <ClInclude Include="vendor\sqlite-3.51.0\sqlite3.h" />
     <ClInclude Include="vendor\sqlite-3.51.0\sqlite3ext.h" />
   </ItemGroup>

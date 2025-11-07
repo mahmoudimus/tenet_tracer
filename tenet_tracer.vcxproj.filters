@@ -24,7 +24,7 @@
     <ClInclude Include="include\Logger.h">
       <Filter>include</Filter>
     </ClInclude>
-    <ClInclude Include="include\PinLocker.h">
+    <ClInclude Include="include\Concurrency.h">
       <Filter>include</Filter>
     </ClInclude>
     <ClInclude Include="include\PathUtils.h">
@@ -38,6 +38,9 @@
     </ClInclude>
     <ClInclude Include="SqliteLogHandler.h">
       <Filter>include</Filter>
+    </ClInclude>
+    <ClInclude Include="vendor\json.hpp">
+      <Filter>vendor</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
