@@ -1,6 +1,7 @@
 // tenet_tracer_tool.cpp
 // Build with Pin 3.31 (intel64), C++11, /MD. Requires your ImageManager.h and Logger.h.
 
+#include "pin.H"
 #include <array>
 #include <algorithm>
 #include <iomanip>
@@ -11,12 +12,10 @@
 #include <vector>
 #include <utility>
 #include <map>
-#include <memory>
 #include <unordered_map>
 #include <set>
 #include <sstream>
 
-#include "pin.H"
 
 #if defined(_WIN32) || defined(_WIN64)
 namespace WINDOWS
@@ -26,7 +25,7 @@ namespace WINDOWS
 #endif
 
 #include "ImageManager.h"
-#include "PinLocker.h"
+#include "Concurrency.h"
 #include "Logger.h"
 
 #include "PathUtils.h"
@@ -42,14 +41,22 @@ namespace WINDOWS
 // Global SQLite database for trace logging
 sqlite3* g_trace_db = nullptr;
 // Global queue for all trace entries
-std::vector<tenet_tracer::GlobalTraceEntry> tenet_tracer::g_trace_queue;
-PinSpinLock tenet_tracer::g_trace_queue_lock;
-PIN_THREAD_UID tenet_tracer::g_flush_thread_uid = 0;
-bool tenet_tracer::g_flush_thread_should_exit = false;
+std::deque<tenet_tracer::logging::GlobalTraceEntry> tenet_tracer::logging::g_trace_queue;
+tenet_tracer::concurrency::PinSpinLock tenet_tracer::logging::g_trace_queue_lock;
+std::unique_ptr<tenet_tracer::concurrency::PinThread> tenet_tracer::logging::g_flush_thread;
+tenet_tracer::concurrency::PinSemaphore tenet_tracer::logging::g_flush_thread_exit_sem;
 // Global shared state to avoid function-local statics in SqliteLogHandler
-tenet_tracer::SqliteSharedState tenet_tracer::g_sqlite_state;
+tenet_tracer::logging::SqliteSharedState tenet_tracer::logging::g_sqlite_state;
+// TLS key for per-thread buffers
+TLS_KEY tenet_tracer::logging::g_buffer_tls_key = INVALID_TLS_KEY;
 #endif
-std::unique_ptr<tenet_tracer::Logger> meta_logger;
+
+#if defined(_WIN32) || defined(_WIN64)
+WINDOWS::HANDLE tenet_tracer::logging::winconsole::hStdout = nullptr;
+#endif
+
+std::unique_ptr<tenet_tracer::logging::Logger> meta_logger;
+
 
 // -----------------------------------------------------
 // Tool arguments (knobs)
@@ -64,7 +71,7 @@ static KNOB<std::string> KnobOutputFilePrefix(
 
 static KNOB<std::string> KnobImageBase(
     KNOB_MODE_APPEND, "pintool", "i", "",
-    "Image base address remapping. Syntax: ImageName:0xBase. Example: -i WowT.exe:0x140000000");
+    "Image base address remapping. Syntax: ImageName:0xBase. Example: -i notepad.exe:0x140000000");
 
 // Name of a DLL to trace exclusively; tracing starts when it is loaded.
 static KNOB<std::string> KnobTraceModule(
@@ -92,11 +99,11 @@ struct alignas(64) ThreadData
     ADDRINT mem_r_addr{0}, mem_r_size{0};
     ADDRINT mem_r2_addr{0}, mem_r2_size{0};
 
-    std::unordered_map<std::string, std::unique_ptr<tenet_tracer::Logger>> m_image_logs;
+    std::unordered_map<std::string, std::unique_ptr<tenet_tracer::logging::Logger>> m_image_logs;
     alignas(64) char m_scratch[1024]{};
 
     // Optional utility if you want a per-image+tid file under a dir
-    tenet_tracer::Logger& GetOrCreateLogger(const std::string& imageBaseName,
+    tenet_tracer::logging::Logger& GetOrCreateLogger(const std::string& imageBaseName,
                                             const std::string& logDir,
                                             int pid,
                                             THREADID tid)
@@ -107,12 +114,12 @@ struct alignas(64) ThreadData
         if (it != m_image_logs.end()) return *(it->second);
 
         std::ostringstream path;
-        path << logDir << PathUtils::PATH_SEP
-            << PathUtils::SanitizeFilename(imageBaseName)
+        path << logDir << tenet_tracer::pathutils::PATH_SEP
+            << tenet_tracer::pathutils::SanitizeFilename(imageBaseName)
             << "_pid" << pid << "_T" << tid << ".log";
 
-        PathUtils::EnsureDirectoryExists(path.str());
-        auto logger = tenet_tracer::LoggerBuilder()
+        tenet_tracer::pathutils::EnsureDirectoryExists(path.str());
+        auto logger = tenet_tracer::logging::LoggerBuilder()
                       .addFileHandler(path.str(), 10 * 1024 * 1024, false)
                       .build();
         logger->setThreadId(static_cast<unsigned>(tid));
@@ -146,7 +153,7 @@ public:
 
         m_tls_key = PIN_CreateThreadDataKey(nullptr);
         if (meta_logger) meta_logger->info("Initializing ToolContext before creating ImageManager!");
-        m_images = std::make_unique<ImageManager>();
+        m_images = std::make_unique<tenet_tracer::imgmgr::ImageManager>();
         if (meta_logger) meta_logger->info("Initializing ToolContext AFTER! creating ImageManager!");
     }
 
@@ -166,7 +173,7 @@ public:
     // Binary search for the image base owning 'addr'. Vector must be sorted by low_.
     ADDRINT FindImageBaseForAddress(ADDRINT addr) const noexcept
     {
-        LoadedImage probe("probe", addr, 0, 0);
+        tenet_tracer::imgmgr::LoadedImage probe("probe", addr, 0, 0);
         auto it = std::upper_bound(m_loaded_images.begin(), m_loaded_images.end(), probe);
         if (it == m_loaded_images.begin()) return 0;
         --it;
@@ -217,7 +224,7 @@ public:
 
     TLS_KEY TlsKey() const noexcept { return m_tls_key; }
 
-    std::unique_ptr<ImageManager> m_images; // your manager
+    std::unique_ptr<tenet_tracer::imgmgr::ImageManager> m_images; // your manager
     std::string log_dir = "logs"; // optional dir for per-image-per-thread logs
 
     // Global-ish state used by callbacks:
@@ -227,10 +234,10 @@ public:
     bool m_tracing_started;
 
     // Expose lock for rare reads (if you want to lock during read)
-    mutable PinSpinLock m_loaded_images_lock;
-    std::vector<LoadedImage> m_loaded_images; // kept sorted by low_
+    mutable tenet_tracer::concurrency::PinSpinLock m_loaded_images_lock;
+    std::vector<tenet_tracer::imgmgr::LoadedImage> m_loaded_images; // kept sorted by low_
 
-    mutable PinSpinLock m_thread_lock;
+    mutable tenet_tracer::concurrency::PinSpinLock m_thread_lock;
     std::set<THREADID> m_seen_threads;
     std::vector<ThreadData*> m_terminated_threads;
 
@@ -242,7 +249,7 @@ public:
     std::string GetImageNameForAddress(ADDRINT addr)
     {
         auto lock = this->m_loaded_images_lock.acquire_read();
-        LoadedImage probe("probe", addr, 0, 0);
+        tenet_tracer::imgmgr::LoadedImage probe("probe", addr, 0, 0);
         auto it = std::upper_bound(this->m_loaded_images.begin(),
                                    this->m_loaded_images.end(), probe);
         if (it == this->m_loaded_images.begin())
@@ -253,7 +260,7 @@ public:
         if (addr >= it->low_ && addr < it->high_)
         {
             std::string name = it->name_;
-            return PathUtils::GetBaseName(name);
+            return tenet_tracer::pathutils::GetBaseName(name);
         }
         return "unknown";
     }
@@ -262,7 +269,7 @@ public:
     ADDRINT RebaseAddress(ADDRINT addr)
     {
         auto lock = this->m_loaded_images_lock.acquire_read();
-        LoadedImage probe("probe", addr, 0, 0);
+        tenet_tracer::imgmgr::LoadedImage probe("probe", addr, 0, 0);
         auto it = std::upper_bound(this->m_loaded_images.begin(),
                                    this->m_loaded_images.end(), probe);
         if (it == this->m_loaded_images.begin())
@@ -321,7 +328,7 @@ static VOID OnThreadFini(THREADID tid, const CONTEXT*, INT32, VOID* v)
 static VOID OnImageLoad(IMG img, VOID* v)
 {
     auto& context = *static_cast<ToolContext*>(v);
-    std::string img_name = PathUtils::GetBaseName(IMG_Name(img));
+    std::string img_name = tenet_tracer::pathutils::GetBaseName(IMG_Name(img));
     ADDRINT low = IMG_LowAddress(img);
     ADDRINT high = IMG_HighAddress(img);
     ADDRINT desired_base = 0;
@@ -418,23 +425,23 @@ static VOID record_diff(const CONTEXT* cpu, ADDRINT pc, VOID* v)
                                     : '_';
     }
 
-    tenet_tracer::Logger* out_logger = nullptr;
+    tenet_tracer::logging::Logger* out_logger = nullptr;
     auto it = data->m_image_logs.find(sanitized_image_name);
     if (it == data->m_image_logs.end())
     {
         std::string prefix = KnobOutputFilePrefix.Value();
-        PathUtils::EnsureDirectoryExists(prefix);
+        tenet_tracer::pathutils::EnsureDirectoryExists(prefix);
         // prefix.<image>.log ; handler will NOT append tid (we include tid in name below if desired)
         std::string baseFilename = prefix + "." + sanitized_image_name + ".log";
         // Create builder and conditionally add handlers
-        tenet_tracer::LoggerBuilder builder;
+        tenet_tracer::logging::LoggerBuilder builder;
         
 #if defined(USE_SQLITE3)
         // SQLite mode: use SQLite handler for structured query support (writes to global queue)
-        builder.addHandler<tenet_tracer::SqliteLogHandler>(
+        builder.addHandler<tenet_tracer::logging::SqliteLogHandler>(
             g_trace_db,
             sanitized_image_name,
-            100  // batch size
+            10000  // batch size (10k entries at a time)
         );
         const char* _log_type = "sqlite";
 #else
@@ -522,7 +529,7 @@ static VOID record_diff(const CONTEXT* cpu, ADDRINT pc, VOID* v)
                 m_scratch[i])) & 0xff);
         data->mem_w_size = 0;
     }
-
+    //meta_logger->infof("About to log: %s", oss.str().c_str());
     out_logger->log(oss.str());
 }
 
@@ -598,9 +605,13 @@ static VOID OnInst(INS ins, VOID* v)
 static VOID PrepareForFini(VOID* v)
 {
 #if defined(USE_SQLITE3)
+    // Flush all thread-local buffers before stopping flush thread
+    if (meta_logger) meta_logger->info("Flushing thread-local buffers...");
+    tenet_tracer::logging::SqliteLogHandler::FlushAllThreadBuffers();
+    
     // Stop background flush thread (it will flush remaining entries)
     if (meta_logger) meta_logger->info("Stopping background SQLite flush thread...");
-    tenet_tracer::SqliteLogHandler::StopBackgroundFlushThread();
+    tenet_tracer::logging::SqliteLogHandler::StopBackgroundFlushThread();
     if (meta_logger) meta_logger->info("Background flush thread stopped");
 #endif
 }
@@ -631,12 +642,8 @@ static VOID Fini(INT32, VOID* v)
     context.m_terminated_threads.clear();
 
 #if defined(USE_SQLITE3)
-    // Flush any remaining entries in queue (background thread should have done most)
+    // Background thread already flushed all entries in PrepareForFini
     if (g_trace_db) {
-        if (meta_logger) meta_logger->info("Flushing remaining trace queue to SQLite database...");
-        tenet_tracer::SqliteLogHandler::FlushQueueToDatabase(g_trace_db);
-        if (meta_logger) meta_logger->info("Trace queue flushed successfully");
-        
         // Force WAL checkpoint before closing
         sqlite3_exec(g_trace_db, "PRAGMA wal_checkpoint(FULL);", nullptr, nullptr, nullptr);
         sqlite3_close(g_trace_db);
@@ -678,13 +685,16 @@ int main(int argc, char* argv[])
 
     if (PIN_Init(argc, argv)) return Usage();
 
+    WINDOWS::AllocConsole();
+    tenet_tracer::logging::winconsole::hStdout = WINDOWS::GetStdHandle((WINDOWS::DWORD)-11);
+
     PIN_AddInternalExceptionHandler(ExceptionHandler, nullptr);
 
     // Global logs (rotated at 10MB)
     const auto metaFile = KnobOutputFilePrefix.Value() + ".meta.txt";
 
-    meta_logger = tenet_tracer::LoggerBuilder()
-                  .addFileHandler(metaFile, 10 * 1024 * 1024, false)
+    meta_logger = tenet_tracer::logging::LoggerBuilder()
+                  .addFileHandler(metaFile, 10 * 1024 * 1024, false, true, true)
                   .build();
 
 #if defined(USE_SQLITE3)
@@ -705,8 +715,14 @@ int main(int argc, char* argv[])
             if (errMsg) sqlite3_free(errMsg);
         }
         
+        // Initialize TLS key for per-thread buffers
+        tenet_tracer::logging::g_buffer_tls_key = PIN_CreateThreadDataKey(nullptr);
+        if (tenet_tracer::logging::g_buffer_tls_key == INVALID_TLS_KEY) {
+            meta_logger->error("Failed to create TLS key for thread-local buffers");
+        }
+        
         // Start background flush thread to periodically write batches
-        tenet_tracer::SqliteLogHandler::StartBackgroundFlushThread(g_trace_db);
+        tenet_tracer::logging::SqliteLogHandler::StartBackgroundFlushThread(g_trace_db, meta_logger.get());
         meta_logger->info("Background SQLite flush thread started");
     }
     else
@@ -774,7 +790,8 @@ int main(int argc, char* argv[])
     PIN_AddPrepareForFiniFunction(PrepareForFini, nullptr);
     PIN_AddFiniFunction(Fini, g_context.get());
 
-    // Run the target (never returns)
+    // Run the target (returns when program terminates)
     PIN_StartProgram();
+
     return 0;
 }
