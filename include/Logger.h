@@ -30,13 +30,15 @@
 
 #include <cstdarg>
 #include <cstring>
+#include <ctime>
 #include <fstream>
-#include <mutex>
-#include <memory>
 #include <string>
 #include <vector>
 
+
 namespace tenet_tracer
+{
+namespace logging
 {
     namespace detail {
         inline std::string vformat(const char* fmt, va_list ap) {
@@ -102,11 +104,13 @@ namespace tenet_tracer
         FileLogHandler(const std::string& baseFilename,
             std::size_t maxFileSize = 10 * 1024 * 1024,
             bool appendThreadId = false,
-            bool includeLogLevel = true)
+            bool includeLogLevel = true,
+            bool includeTimestamp = false)
             : baseFilename_(baseFilename),
             maxFileSize_(maxFileSize),
             appendThreadId_(appendThreadId),
             includeLogLevel_(includeLogLevel),
+            includeTimestamp_(includeTimestamp),
             currentThreadId_(static_cast<unsigned>(-1))
         {
         }
@@ -137,6 +141,15 @@ namespace tenet_tracer
             openFile();
             if (!file_.is_open()) return;
 
+            // Format: [TIMESTAMP] [LEVEL] message
+            if (includeTimestamp_) {
+                std::time_t now = std::time(nullptr);
+                std::tm* tm_info = std::localtime(&now);
+                char time_buf[64];
+                std::strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", tm_info);
+                file_ << "[" << time_buf << "] ";
+            }
+            
             if (includeLogLevel_)
                 file_ << "[" << logLevelToString(level) << "] " << message << '\n';
             else
@@ -157,6 +170,7 @@ namespace tenet_tracer
         std::size_t maxFileSize_;
         bool appendThreadId_;
         bool includeLogLevel_;
+        bool includeTimestamp_;
         unsigned currentThreadId_;
         std::string currentFilename_;
         std::ofstream file_;
@@ -318,9 +332,10 @@ namespace tenet_tracer
         LoggerBuilder& addFileHandler(const std::string& filename,
             std::size_t maxFileSize = 10 * 1024 * 1024,
             bool appendThreadId = false,
-            bool includeLogLevel = true)
+            bool includeLogLevel = true,
+            bool includeTimestamp = false)
         {
-            handlers_.push_back(std::make_unique<FileLogHandler>(filename, maxFileSize, appendThreadId, includeLogLevel));
+            handlers_.push_back(std::make_unique<FileLogHandler>(filename, maxFileSize, appendThreadId, includeLogLevel, includeTimestamp));
             return *this;
         }
 
@@ -355,6 +370,91 @@ namespace tenet_tracer
         std::vector<std::unique_ptr<LogHandler>> handlers_;
         LogLevel minLevel_;
     };
+    
+    namespace winconsole {
+        
+        extern WINDOWS::HANDLE hStdout;
+        
+        void _log(WINDOWS::HANDLE hOutput, const char *level, const char *format, va_list args)
+        {
+            int len;
+            char *message;
+            char *finalFormat;
+            const char *logformat = "\n[%s] %s\n";
+
+            len = snprintf(NULL, 0, logformat, level, format);
+            len++; // Trailing null byte.
+
+            finalFormat = (char *)malloc(len);
+
+            len = snprintf(finalFormat, len, logformat, level, format);
+
+            len = vsnprintf(NULL, 0, finalFormat, args);
+
+            message = (char *)malloc(len);
+
+            vsnprintf(message, len, finalFormat, args);
+
+            // Write output
+            WINDOWS::WriteConsoleA(hOutput, message, strlen(message), NULL, NULL);
+
+            free(message);
+            free(finalFormat);
+        }
+
+        void debugLog(const char *fmt, ...)
+        {
+            // Set console color
+            WINDOWS::SetConsoleTextAttribute(hStdout, FOREGROUND_BLUE | FOREGROUND_INTENSITY);
+
+            va_list args;
+            va_start(args, fmt);
+            _log(hStdout, "DEBUG", fmt, args);
+
+            // Restore console color
+            WINDOWS::SetConsoleTextAttribute(hStdout, 15);
+        }
+
+        void errorLog(const char *fmt, ...)
+        {
+            // Set console color
+            WINDOWS::SetConsoleTextAttribute(hStdout, 4);
+
+            va_list args;
+            va_start(args, fmt);
+            _log(hStdout, "ERROR", fmt, args);
+
+            // Restore console color
+            WINDOWS::SetConsoleTextAttribute(hStdout, 15);
+        }
+
+        void highlightedLog(const char *fmt, ...)
+        {
+            // Set console color
+            WINDOWS::SetConsoleTextAttribute(hStdout, FOREGROUND_GREEN | FOREGROUND_INTENSITY);
+
+            va_list args;
+            va_start(args, fmt);
+            _log(hStdout, "DETECTION", fmt, args);
+
+            // Restore console color
+            WINDOWS::SetConsoleTextAttribute(hStdout, 15);
+        }
+
+        void verboseLog(const char *title, const char *fmt, ...)
+        {
+            // Set console color
+            WINDOWS::SetConsoleTextAttribute(hStdout, 14);
+
+            va_list args;
+            va_start(args, fmt);
+            _log(hStdout, title, fmt, args);
+
+            // Restore console color
+            WINDOWS::SetConsoleTextAttribute(hStdout, 15);
+        }
+    }
+} // namespace logging
 } // namespace tenet_tracer
 
 #endif // LOGGER_H
