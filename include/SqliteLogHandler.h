@@ -75,15 +75,7 @@
                       .build();
 
        meta_logger->info("SQLite trace database opened: tenet_trace.db");
-   }
-   #endif
-
-// Query examples after tracing:
-
-// List all tables
-sqlite3 tenet_trace.db ".tables"
-
-// Show schema
+   }ESCschema
 sqlite3 tenet_trace.db ".schema trace_trace"
 
 // Count total trace entries
@@ -125,23 +117,26 @@ This pattern is common in high-performance tracing tools: keep the hot path (ins
 
 #ifndef SQLITE_LOG_HANDLER_H
 #define SQLITE_LOG_HANDLER_H
+#include "pin.H"
 
 #include <queue>
 #include <set>
 #include <map>
 #include <vector>
+#include <deque>
 #include <string>
 #include <ctime>
 #include <cstring>
 #include <sstream>
-
-#include "pin.H"
+#include <iterator>
 #include <sqlite3.h>
 
 #include "Logger.h" // for LogHandler, LogLevel, logLevelToString
-#include "PinLocker.h"
+#include "Concurrency.h"
 
 namespace tenet_tracer
+{
+namespace logging
 {
     // Global queue for all trace entries - will be flushed to SQLite at program end
     struct GlobalTraceEntry {
@@ -155,10 +150,44 @@ namespace tenet_tracer
     };
     
     // Global queue and lock - shared by all SqliteLogHandler instances
-    extern std::vector<GlobalTraceEntry> g_trace_queue;
-    extern PinSpinLock g_trace_queue_lock;
-    extern PIN_THREAD_UID g_flush_thread_uid;  // Background flush thread UID
-    extern bool g_flush_thread_should_exit;    // Flag to signal background thread to exit
+    extern std::deque<GlobalTraceEntry> g_trace_queue;
+    extern tenet_tracer::concurrency::PinSpinLock g_trace_queue_lock;
+    extern std::unique_ptr<tenet_tracer::concurrency::PinThread> g_flush_thread;  // Background flush thread
+    extern tenet_tracer::concurrency::PinSemaphore g_flush_thread_exit_sem;  // Semaphore to signal background thread to exit
+    
+    // Per-thread buffer for batching entries before pushing to global queue
+    struct ThreadLocalBuffer {
+        std::vector<GlobalTraceEntry> entries;
+        static const size_t BUFFER_SIZE = 1000;  // Flush when buffer reaches this size
+        static const long long FLUSH_INTERVAL_SEC = 1;  // Flush every 1 second even if not full
+        long long last_flush_time;  // Timestamp of last flush (seconds since epoch)
+        
+        ThreadLocalBuffer() : entries(), last_flush_time(static_cast<long long>(std::time(nullptr))) {
+            entries.reserve(BUFFER_SIZE);
+        }
+        
+        void flushToGlobalQueue() {
+            if (entries.empty()) return;
+            
+            auto lock = g_trace_queue_lock.acquire_write();
+            // Move all entries to global queue in one operation
+            // Table names are already set when entries are created
+            for (auto& entry : entries) {
+                g_trace_queue.push_back(std::move(entry));
+            }
+            entries.clear();
+            entries.reserve(BUFFER_SIZE);  // Re-reserve for next batch
+            last_flush_time = static_cast<long long>(std::time(nullptr));  // Update flush time
+        }
+        
+        bool shouldFlushByTime() const {
+            long long now = static_cast<long long>(std::time(nullptr));
+            return (now - last_flush_time) >= FLUSH_INTERVAL_SEC;
+        }
+    };
+    
+    // TLS key for per-thread buffers (initialized in cpp file)
+    extern TLS_KEY g_buffer_tls_key;
     
     // Global SQLite shared state to avoid function-local statics (which pull in
     // MSVC thread-safe static initialization helpers like _Init_thread_header)
@@ -176,7 +205,7 @@ namespace tenet_tracer
     class SqliteLogHandler : public LogHandler
     {
     public:
-        SqliteLogHandler(sqlite3* db, const std::string& tableName, size_t batchSize = 100)
+        SqliteLogHandler(sqlite3* db, const std::string& tableName, size_t /*batchSize*/ = 100)
             : db_(db), tableName_(tableName) {
             // Just store table name - all writes go to global queue
             // Tables will be created when flushing
@@ -188,14 +217,23 @@ namespace tenet_tracer
 
         void log(const std::string& message, unsigned tid, LogLevel level) override {
             if (!db_) return;
-
+            
+            // Get or create thread-local buffer
+            THREADID pinTid = PIN_ThreadId();
+            ThreadLocalBuffer* buffer = static_cast<ThreadLocalBuffer*>(PIN_GetThreadData(g_buffer_tls_key, pinTid));
+            if (!buffer) {
+                buffer = new ThreadLocalBuffer();
+                PIN_SetThreadData(g_buffer_tls_key, buffer, pinTid);
+            }
+            
             // Parse the trace message
             DbLogEntry entry;
             entry.timestamp = static_cast<long long>(std::time(nullptr));
             entry.tid = tid;
+
             parseTraceMessage(message, entry);
-            
-            // Push to global queue
+
+            // Add to thread-local buffer
             GlobalTraceEntry globalEntry;
             globalEntry.tableName = tableName_;
             globalEntry.timestamp = entry.timestamp;
@@ -205,9 +243,12 @@ namespace tenet_tracer
             globalEntry.mem_reads = entry.mem_reads;
             globalEntry.mem_writes = entry.mem_writes;
             
-            {
-                auto lock = g_trace_queue_lock.acquire_write();
-                g_trace_queue.push_back(globalEntry);
+            buffer->entries.push_back(std::move(globalEntry));
+            
+            // Flush buffer to global queue if it's full or if enough time has passed
+            // This ensures continuous flushing even with low activity
+            if (buffer->entries.size() >= ThreadLocalBuffer::BUFFER_SIZE || buffer->shouldFlushByTime()) {
+                buffer->flushToGlobalQueue();
             }
         }
 
@@ -215,26 +256,50 @@ namespace tenet_tracer
             // Nothing to do - global queue will be flushed in Fini()
         }
         
+        // Result of flushing a batch
+        struct FlushResult {
+            size_t flushed;
+            size_t available;
+            double flush_time;  // Time taken to flush in seconds
+            
+            FlushResult() : flushed(0), available(0), flush_time(0.0) {}
+            FlushResult(size_t f, size_t a, double t = 0.0) : flushed(f), available(a), flush_time(t) {}
+            
+            bool empty() const { return flushed == 0; }
+        };
+        
         // Static function to flush a batch from global queue to SQLite
-        // Returns number of entries flushed
-        static size_t FlushBatchToDatabase(sqlite3* db, size_t batchSize = 10000) {
-            if (!db) return 0;
+        // Returns number of entries flushed and how many were available
+        static FlushResult FlushBatchToDatabase(sqlite3* db, size_t batchSize = 10000, Logger* meta = nullptr) {
+            if (!db) return FlushResult();
             
             // Get batch from queue
             std::vector<GlobalTraceEntry> batch;
             batch.reserve(batchSize);
+            size_t available = 0;
+            double queue_time = 0.0;
             
             {
+                std::clock_t queue_start = std::clock();
                 auto lock = g_trace_queue_lock.acquire_write();
-                size_t available = g_trace_queue.size();
+                available = g_trace_queue.size();
                 if (available > 0) {
                     size_t toTake = (available < batchSize) ? available : batchSize;
-                    batch.assign(g_trace_queue.begin(), g_trace_queue.begin() + toTake);
-                    g_trace_queue.erase(g_trace_queue.begin(), g_trace_queue.begin() + toTake);
+                    batch.reserve(toTake);
+                    // Move elements from front of deque to batch, then pop them
+                    for (size_t i = 0; i < toTake; ++i) {
+                        batch.push_back(std::move(g_trace_queue.front()));
+                        g_trace_queue.pop_front();
+                    }
                 }
+                std::clock_t queue_end = std::clock();
+                queue_time = static_cast<double>(queue_end - queue_start) / CLOCKS_PER_SEC;
             }
             
-            if (batch.empty()) return 0;
+            if (batch.empty()) return FlushResult(0, available);
+            
+            // Start timing
+            std::clock_t start_time = std::clock();
             
             // Set up SQLite for batch insert (only if not already done)
             if (!g_sqlite_state.sqliteInitialized) {
@@ -249,7 +314,7 @@ namespace tenet_tracer
             
             size_t entriesProcessed = 0;
             for (const auto& entry : batch) {
-                // Create table if needed
+                // Create table if needed (without index for now - indexes created at shutdown)
                 if (g_sqlite_state.createdTables.find(entry.tableName) == g_sqlite_state.createdTables.end()) {
                     std::string createTableSql = 
                         R"(CREATE TABLE IF NOT EXISTS )" + entry.tableName + R"(_trace (
@@ -262,11 +327,6 @@ namespace tenet_tracer
                             mem_writes TEXT
                         );)";
                     sqlite3_exec(db, createTableSql.c_str(), nullptr, nullptr, nullptr);
-                    
-                    std::string createIndexSql = 
-                        R"(CREATE INDEX IF NOT EXISTS idx_)" + entry.tableName + R"(_trace_tid_ts 
-                        ON )" + entry.tableName + R"(_trace(tid, timestamp);)";
-                    sqlite3_exec(db, createIndexSql.c_str(), nullptr, nullptr, nullptr);
                     
                     g_sqlite_state.createdTables.insert(entry.tableName);
                 }
@@ -296,123 +356,199 @@ namespace tenet_tracer
                     sqlite3_reset(stmt);
                 }
                 
-                // Progress reporting every 50,000 entries
                 entriesProcessed++;
-                if (entriesProcessed % 50000 == 0) {
-                    fprintf(stderr, "  Flushed %zu / %zu entries (%.1f%%)\n", 
-                            entriesProcessed, batch.size(),
-                            (entriesProcessed * 100.0) / batch.size());
-                }
             }
             
             sqlite3_exec(db, "COMMIT;", nullptr, nullptr, nullptr);
             
-            return entriesProcessed;
+            // Calculate elapsed time
+            std::clock_t end_time = std::clock();
+            double elapsed_seconds = static_cast<double>(end_time - start_time) / CLOCKS_PER_SEC;
+            
+            FlushResult result(entriesProcessed, available, elapsed_seconds);
+            
+            // Log statistics if meta logger is provided
+            if (meta && result.flushed > 0) {
+                if (result.available > 0) {
+                    meta->infof("Flushed %zu / %zu entries (%.1f%%) in %.2f seconds (queue: %.3fs)", 
+                               result.flushed, result.available,
+                               (result.flushed * 100.0) / result.available,
+                               result.flush_time, queue_time);
+                } else {
+                    meta->infof("Flushed %zu entries in %.2f seconds (queue: %.3fs)", 
+                               result.flushed, result.flush_time, queue_time);
+                }
+            }
+            
+            return result;
         }
         
         // Static function to flush entire queue to SQLite (called from Fini())
-        static void FlushQueueToDatabase(sqlite3* db) {
+        static void FlushQueueToDatabase(sqlite3* db, Logger* meta = nullptr) {
             if (!db) return;
             
-            fprintf(stderr, "Flushing remaining trace queue to SQLite database...\n");
-            size_t totalFlushed = 0;
+            if (meta) meta->info("Flushing remaining trace queue to SQLite database...");
             
             // Keep flushing batches until queue is empty
+            // FlushBatchToDatabase will handle the logging
             while (true) {
-                size_t flushed = FlushBatchToDatabase(db, 10000);
-                if (flushed == 0) break;
-                totalFlushed += flushed;
-                if (totalFlushed % 50000 == 0) {
-                    fprintf(stderr, "  Flushed %zu entries so far...\n", totalFlushed);
-                }
+                FlushResult result = FlushBatchToDatabase(db, 100000, meta);
+                if (result.empty()) break;
             }
-            
-            // Clean up static statements (shared with FlushBatchToDatabase)
-            // Note: statements are cleaned up in FlushBatchToDatabase's static variables
-            // We'll finalize them here by accessing the static map
-            // Actually, they'll persist and be cleaned up automatically at program exit
-            
-            fprintf(stderr, "  Wrote %zu total trace entries\n", totalFlushed);
-        }
-        
-        // Background thread that periodically flushes batches
-        static VOID BackgroundFlushThread(VOID* arg) {
-            sqlite3* db = static_cast<sqlite3*>(arg);
-            if (!db) return;
-            
-            // Process batches every ~100ms
-            while (true) {
-                PIN_Sleep(100); // Sleep 100ms
-                
-                // Check if we should exit
-                bool shouldExit;
-                {
-                    auto lock = g_trace_queue_lock.acquire_read();
-                    shouldExit = g_flush_thread_should_exit;
-                }
-                
-                if (shouldExit) {
-                    // Flush any remaining entries before exiting
-                    while (FlushBatchToDatabase(db, 10000) > 0) {
-                        // Keep flushing until empty
-                    }
-                    break;
-                }
-                
-                // Flush a batch (10k entries at a time)
-                size_t flushed = FlushBatchToDatabase(db, 10000);
-                if (flushed > 0 && flushed >= 10000) {
-                    fprintf(stderr, "  Background flush: %zu entries\n", flushed);
-                }
-            }
-            
-            PIN_ExitThread(0);
         }
         
         // Start the background flush thread
-        static void StartBackgroundFlushThread(sqlite3* db) {
+        static void StartBackgroundFlushThread(sqlite3* db, Logger* meta = nullptr) {
             if (!db) return;
             
             bool alreadyStarted;
             {
                 auto lock = g_trace_queue_lock.acquire_read();
-                alreadyStarted = (g_flush_thread_uid != 0);
+                alreadyStarted = (g_flush_thread != nullptr);
             }
             
             if (alreadyStarted) return;
             
-            THREADID threadId = PIN_SpawnInternalThread(BackgroundFlushThread, db, 0, &g_flush_thread_uid);
-            if (threadId == INVALID_THREADID) {
-                fprintf(stderr, "Failed to spawn background flush thread\n");
+            // Create PinThread with lambda that captures db and meta
+            auto thread = std::unique_ptr<tenet_tracer::concurrency::PinThread>(
+                new tenet_tracer::concurrency::PinThread([db, meta]() {
+                    size_t batchSize = 10 * 1024;  // Start with 10k entries (will adaptively grow)
+                    const size_t minBatchSize = 1 * 1024 * 1024;  // 1M entries
+                    const size_t maxBatchSize = 3 * 1024 * 1024;  // Cap at 3M to avoid long lock holds
+                    auto batch_threshold_sec = 0.05;
+                    while (true) {
+                        // Check if we should exit
+                        if (g_flush_thread_exit_sem.is_set()) {
+                            // Flush any remaining entries before exiting
+                            size_t effectiveBatchSize = (batchSize > maxBatchSize) ? maxBatchSize : batchSize;
+                            FlushResult result = FlushBatchToDatabase(db, effectiveBatchSize, meta);
+                            while (!result.empty()) {
+                                // Keep flushing until empty
+                                if (result.flush_time <= batch_threshold_sec) {
+                                    batchSize = min(
+                                        (batchSize >= minBatchSize) ? (batchSize + minBatchSize) : (batchSize * 10),
+                                        maxBatchSize
+                                    );
+                                }
+                                effectiveBatchSize = (batchSize > maxBatchSize) ? maxBatchSize : batchSize;
+                                result = FlushBatchToDatabase(db, effectiveBatchSize, meta);
+                            }
+                            
+                            // Create indexes for all tables after all data is flushed (much faster)
+                            if (meta && !g_sqlite_state.createdTables.empty()) {
+                                meta->infof("Creating indexes for %zu trace tables...", g_sqlite_state.createdTables.size());
+                                
+                                // Optimize SQLite for index creation
+                                sqlite3_exec(db, "PRAGMA cache_size = -512000;", nullptr, nullptr, nullptr);  // 512MB cache
+                                sqlite3_exec(db, "PRAGMA temp_store = MEMORY;", nullptr, nullptr, nullptr);
+                                sqlite3_exec(db, "PRAGMA synchronous = OFF;", nullptr, nullptr, nullptr);  // Faster for index creation
+                                
+                                std::clock_t index_start = std::clock();
+                                size_t table_count = 0;
+                                for (const auto& tableName : g_sqlite_state.createdTables) {
+                                    std::clock_t table_start = std::clock();
+                                    
+                                    // Get row count for progress info
+                                    std::string countSql = "SELECT COUNT(*) FROM " + tableName + "_trace;";
+                                    sqlite3_stmt* countStmt = nullptr;
+                                    long long rowCount = 0;
+                                    if (sqlite3_prepare_v2(db, countSql.c_str(), -1, &countStmt, nullptr) == SQLITE_OK) {
+                                        if (sqlite3_step(countStmt) == SQLITE_ROW) {
+                                            rowCount = sqlite3_column_int64(countStmt, 0);
+                                        }
+                                        sqlite3_finalize(countStmt);
+                                    }
+                                    
+                                    if (meta && rowCount > 0) {
+                                        meta->infof("  [%zu/%zu] Indexing %s (%lld rows)...", 
+                                                   table_count + 1, g_sqlite_state.createdTables.size(), 
+                                                   tableName.c_str(), rowCount);
+                                    }
+                                    
+                                    std::string createIndexSql = 
+                                        R"(CREATE INDEX IF NOT EXISTS idx_)" + tableName + R"(_trace_tid_ts 
+                                        ON )" + tableName + R"(_trace(tid, timestamp);)";
+                                    sqlite3_exec(db, createIndexSql.c_str(), nullptr, nullptr, nullptr);
+                                    
+                                    std::clock_t table_end = std::clock();
+                                    double table_time = static_cast<double>(table_end - table_start) / CLOCKS_PER_SEC;
+                                    table_count++;
+                                    if (meta) {
+                                        meta->infof("  [%zu/%zu] Indexed %s (%.2fs)", 
+                                                   table_count, g_sqlite_state.createdTables.size(), 
+                                                   tableName.c_str(), table_time);
+                                    }
+                                }
+                                
+                                // Restore normal settings
+                                sqlite3_exec(db, "PRAGMA synchronous = NORMAL;", nullptr, nullptr, nullptr);
+                                
+                                std::clock_t index_end = std::clock();
+                                double total_time = static_cast<double>(index_end - index_start) / CLOCKS_PER_SEC;
+                                if (meta) meta->infof("Index creation complete (%.2fs total)", total_time);
+                            }
+                            
+                            break;
+                        }
+
+                        // Flush a batch with current batch size (capped at max)
+                        size_t effectiveBatchSize = (batchSize > maxBatchSize) ? maxBatchSize : batchSize;
+                        FlushResult result = FlushBatchToDatabase(db, effectiveBatchSize, meta);
+                        
+                        // Adaptive batch sizing: if flush was fast, increase batch size
+                        if (!result.empty() && result.flush_time <= batch_threshold_sec) {
+                            batchSize = min(
+                                (batchSize >= minBatchSize) ? (batchSize + minBatchSize) : (batchSize * 10),
+                                maxBatchSize
+                            );
+                        }
+                        
+                        // If queue is empty, wait briefly before checking again
+                        if (result.empty()) {
+                            g_flush_thread_exit_sem.wait_timed(100);
+                        }
+                    }
+                })
+            );
+            tenet_tracer::logging::winconsole::debugLog("about to start the thread!");
+            // Start the thread
+            thread->run();
+
+            // Store the thread instance
+            {
                 auto lock = g_trace_queue_lock.acquire_write();
-                g_flush_thread_uid = 0;
+                if (thread->thread_id() != INVALID_THREADID) {
+                    g_flush_thread = std::move(thread);
+                } else {
+                    if (meta) meta->error("Failed to spawn background flush thread");
+                }
             }
+            tenet_tracer::logging::winconsole::debugLog("thread started!");
+        }
+        
+        // Flush all thread-local buffers to global queue (called before shutdown)
+        static void FlushAllThreadBuffers() {
+            // Note: We can't easily iterate all threads, so we rely on threads flushing
+            // their own buffers when they exit. This function is a placeholder for
+            // potential future enhancement if needed.
         }
         
         // Stop the background flush thread (called from PrepareForFini)
         static void StopBackgroundFlushThread() {
-            PIN_THREAD_UID uid;
-            {
-                auto lock = g_trace_queue_lock.acquire_read();
-                uid = g_flush_thread_uid;
-            }
-            
-            if (uid == 0) return;
-            
-            // Signal thread to exit
+            std::unique_ptr<tenet_tracer::concurrency::PinThread> thread;
             {
                 auto lock = g_trace_queue_lock.acquire_write();
-                g_flush_thread_should_exit = true;
+                if (!g_flush_thread) {
+                    return;
+                }
+                thread = std::move(g_flush_thread);
             }
             
+            // Signal thread to exit via semaphore
+            g_flush_thread_exit_sem.set();
+            tenet_tracer::logging::winconsole::debugLog("waiting 4 thread to finish!");
             // Wait for thread to finish
-            INT32 exitCode;
-            PIN_WaitForThreadTermination(uid, PIN_INFINITE_TIMEOUT, &exitCode);
-            
-            {
-                auto lock = g_trace_queue_lock.acquire_write();
-                g_flush_thread_uid = 0;
-            }
+            thread->wait();
         }
 
     private:
@@ -426,8 +562,37 @@ namespace tenet_tracer
             std::string mem_writes;
         };
 
+        static std::string escapeJsonString(const std::string& str) {
+            std::string result;
+            result.reserve(str.size() + 10);
+            for (size_t i = 0; i < str.size(); ++i) {
+                char c = str[i];
+                if (c == '"') {
+                    result += "\\\"";
+                } else if (c == '\\') {
+                    result += "\\\\";
+                } else if (c == '\b') {
+                    result += "\\b";
+                } else if (c == '\f') {
+                    result += "\\f";
+                } else if (c == '\n') {
+                    result += "\\n";
+                } else if (c == '\r') {
+                    result += "\\r";
+                } else if (c == '\t') {
+                    result += "\\t";
+                } else if (static_cast<unsigned char>(c) < 0x20) {
+                    char buf[7];
+                    snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(c));
+                    result += buf;
+                } else {
+                    result += c;
+                }
+            }
+            return result;
+        }
+
         void parseTraceMessage(const std::string& message, DbLogEntry& entry) {
-            // Parse format: reg=0xval,reg=0xval,rip=0xval,mr=0xaddr:bytes,mw=0xaddr:bytes
             entry.pc = 0;
             entry.registers = "{}";
             entry.mem_reads = "[]";
@@ -435,17 +600,9 @@ namespace tenet_tracer
 
             if (message.empty()) return;
 
-            std::ostringstream regs;
-            std::ostringstream reads;
-            std::ostringstream writes;
-            
-            regs << "{";
-            reads << "[";
-            writes << "[";
-            
-            bool firstReg = true;
-            bool firstRead = true;
-            bool firstWrite = true;
+            std::vector<std::pair<std::string, std::string> > regs;
+            std::vector<std::pair<std::string, std::string> > reads;
+            std::vector<std::pair<std::string, std::string> > writes;
 
             size_t pos = 0;
             while (pos < message.size()) {
@@ -461,42 +618,78 @@ namespace tenet_tracer
                 if (key == "rip" || key == "eip") {
                     entry.pc = strtoull(value.c_str(), nullptr, 16);
                 } else if (key == "mr") {
-                    // Memory read: mr=0xaddr:hexbytes
                     size_t colonPos = value.find(':');
                     if (colonPos != std::string::npos) {
                         std::string addr = value.substr(0, colonPos);
                         std::string data = value.substr(colonPos + 1);
-                        if (!firstRead) reads << ",";
-                        reads << "{\"addr\":\"" << addr << "\",\"data\":\"" << data << "\"}";
-                        firstRead = false;
+                        reads.push_back(std::make_pair(addr, data));
                     }
                 } else if (key == "mw") {
-                    // Memory write: mw=0xaddr:hexbytes
                     size_t colonPos = value.find(':');
                     if (colonPos != std::string::npos) {
                         std::string addr = value.substr(0, colonPos);
                         std::string data = value.substr(colonPos + 1);
-                        if (!firstWrite) writes << ",";
-                        writes << "{\"addr\":\"" << addr << "\",\"data\":\"" << data << "\"}";
-                        firstWrite = false;
+                        writes.push_back(std::make_pair(addr, data));
                     }
                 } else {
-                    // Regular register
-                    if (!firstReg) regs << ",";
-                    regs << "\"" << key << "\":\"" << value << "\"";
-                    firstReg = false;
+                    regs.push_back(std::make_pair(key, value));
                 }
 
                 pos = commaPos + 1;
             }
 
-            regs << "}";
-            reads << "]";
-            writes << "]";
+            // Build registers JSON object
+            if (regs.empty()) {
+                entry.registers = "{}";
+            } else {
+                std::string regsJson = "{";
+                for (size_t i = 0; i < regs.size(); ++i) {
+                    if (i > 0) regsJson += ",";
+                    regsJson += "\"";
+                    regsJson += escapeJsonString(regs[i].first);
+                    regsJson += "\":\"";
+                    regsJson += escapeJsonString(regs[i].second);
+                    regsJson += "\"";
+                }
+                regsJson += "}";
+                entry.registers = regsJson;
+            }
 
-            entry.registers = regs.str();
-            entry.mem_reads = reads.str();
-            entry.mem_writes = writes.str();
+            // Build reads JSON array
+            if (reads.empty()) {
+                entry.mem_reads = "[]";
+            } else {
+                std::string readsJson = "[";
+                for (size_t i = 0; i < reads.size(); ++i) {
+                    if (i > 0) readsJson += ",";
+                    readsJson += "{\"addr\":\"";
+                    readsJson += escapeJsonString(reads[i].first);
+                    readsJson += "\",\"data\":\"";
+                    readsJson += escapeJsonString(reads[i].second);
+                    readsJson += "\"}";
+                }
+                readsJson += "]";
+                entry.mem_reads = readsJson;
+            }
+
+            // Build writes JSON array
+            if (writes.empty()) {
+                entry.mem_writes = "[]";
+            } else {
+                std::string writesJson = "[";
+                for (size_t i = 0; i < writes.size(); ++i) {
+                    if (i > 0) writesJson += ",";
+                    writesJson += "{\"addr\":\"";
+                    writesJson += escapeJsonString(writes[i].first);
+                    writesJson += "\",\"data\":\"";
+                    writesJson += escapeJsonString(writes[i].second);
+                    writesJson += "\"}";
+                }
+                writesJson += "]";
+                entry.mem_writes = writesJson;
+            }
+
+
         }
 
         sqlite3* db_;
@@ -522,6 +715,7 @@ namespace tenet_tracer
     inline LoggerBuilderSqliteMixin WithSqlite(LoggerBuilder& b) {
         return LoggerBuilderSqliteMixin{b};
     }
+} // namespace logging
 } // namespace tenet_tracer
 
 
