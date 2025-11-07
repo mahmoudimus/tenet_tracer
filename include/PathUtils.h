@@ -4,7 +4,8 @@
 #include <string>
 #include "pin.H"
 
-namespace PathUtils {
+namespace tenet_tracer {
+namespace pathutils {
 
 #if defined(TARGET_WINDOWS)
     const char* const PATH_SEP = "\\";
@@ -70,6 +71,7 @@ inline void EnsureDirectoryExists(const std::string& prefix)
     OS_MkDir(cur.c_str(), 0755);
 }
 
-} // namespace PathUtils
+} // namespace pathutils
+} // namespace tenet_tracer
 
 #endif // PATH_UTILS_H
